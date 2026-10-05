@@ -5420,6 +5420,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == src1_type && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
+                // HOT-Step patch: quant-cpy-generic - see engine/patches/quant-cpy-kquant.patch
+                // Any quantized type convert.cu can dequantize, provided the copy is
+                // the flat same-shape form those converters take. Asking the dispatch
+                // itself is what stops this list drifting from that one.
+                if (src1_type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    ggml_are_same_shape(op->src[0], op->src[1]) &&
+                    ggml_cuda_cpy_quant_to_f32_supported(src0_type)) {
+                    return true;
+                }
                 return false;
             } break;
         case GGML_OP_DUP:
