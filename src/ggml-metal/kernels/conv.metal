@@ -64,6 +64,71 @@ kernel void kernel_im2col(
 template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
 template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 
+// HOT-Step patch: metal-im2col-ic - see engine/patches/metal-im2col-ic.patch
+//
+// N==1 / 1D specialization of kernel_im2col, used by default for N==1 1D
+// convs (see ggml_metal_op_im2col in ggml-metal-ops.cpp;
+// GGML_METAL_IM2COL_IC=0 is kept as an escape hatch back to kernel_im2col
+// above, in case a regression ever turns up in an untested caller).
+//
+// kernel_im2col parallelizes its extra per-threadgroup threads over the
+// batch dim N (see its while(in<args.N) loop) -- fine for batch>1 training
+// workloads, but every Conv1d run at inference time in practice (VAE/vocoder
+// decode across several music-generation backends) has N==1, which collapses
+// that to just KH*KW threads (e.g. 7/32 SIMD lanes for a k=7 conv --
+// confirmed via a real Xcode GPU capture on an M1 Max). This variant
+// parallelizes over IC (input channels) instead, which is always plentiful
+// (64+ in every conv this engine runs). Bit-for-bit equivalent to
+// kernel_im2col when N==1: the N-indexed terms in kernel_im2col's offset math
+// (in*OH*OW*CHW for dst, in*args.ofs0 for src) are simply 0 when in==0, which
+// is the only value N==1 ever takes -- this kernel drops those terms and uses
+// that freed thread axis for IC instead.
+template <typename T>
+kernel void kernel_im2col_ic(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int64_t OH = tgpg[1];
+    const int64_t OW = tgpg[2];
+
+    const int64_t KH = ntg[1];
+    const int64_t KW = ntg[2];
+
+    const int64_t IC = args.CHW / args.KHW;
+
+    const int64_t iic = tgpig[0]*ntg[0] + tpitg[0];
+    const int64_t ikh = tpitg[1];
+    const int64_t ikw = tpitg[2];
+
+    const int64_t ioh = tgpig[1];
+    const int64_t iow = tgpig[2];
+
+    if (iic >= IC) {
+        return;
+    }
+
+    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+
+    const int64_t offset_dst = (ioh*OW + iow)*args.CHW + (iic*(KH*KW) + ikh*KW + ikw);
+
+    device T * pdst = (device T *) (dst);
+
+    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
+        pdst[offset_dst] = 0.0f;
+    } else {
+        const int64_t offset_src = iic*args.ofs1 + iih*args.IW + iiw;
+        pdst[offset_dst] = x[offset_src];
+    }
+}
+
+template [[host_name("kernel_im2col_ic_f32")]] kernel im2col_t kernel_im2col_ic<float>;
+template [[host_name("kernel_im2col_ic_f16")]] kernel im2col_t kernel_im2col_ic<half>;
+
 // TODO: optimize
 typedef void (im2col_ext_t)(
         constant ggml_metal_kargs_im2col & args,

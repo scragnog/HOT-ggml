@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -4432,6 +4433,43 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
+
+    // HOT-Step patch: metal-im2col-ic - see engine/patches/metal-im2col-ic.patch
+    //
+    // Fast path for N==1, 1D convs -- see kernel_im2col_ic's own comment in
+    // kernels/conv.metal. The branch below (kernel_im2col) parallelizes its
+    // per-threadgroup thread count over the batch dim N, which is fine for
+    // batch>1 but collapses to just KH*KW threads when N==1 -- every Conv1d
+    // run at inference time in practice (VAE/vocoder decode across several
+    // music-generation backends) has N==1, confirmed via a real Xcode GPU
+    // capture on an M1 Max: only 7/32 SIMD lanes active for a k=7 conv.
+    // Verified bit-exact (byte-identical decoded PCM against the path below,
+    // same seed) and measured ~3.3-3.7x faster on one backend's VAE decode
+    // stage (28-31s -> 8.5s) before being made the default -- see
+    // engine/patches/README.md for the full writeup. Uses a separate
+    // pipeline/kernel from the path below, so GGML_METAL_IM2COL_IC=0 is kept
+    // as an escape hatch back to the old behavior if a regression ever shows
+    // up in a path this wasn't tested against.
+    static const bool use_ic_path = [] {
+        const char * e = getenv("GGML_METAL_IM2COL_IC");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+
+    if (use_ic_path && !is_2D && N == 1 && KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        auto pipeline_ic = ggml_metal_library_get_pipeline_im2col_ic(lib, op);
+
+        const uint64_t icptg     = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_ic) / (uint64_t) (KH*KW), (uint64_t) IC);
+        const uint64_t ic_groups = ((uint64_t) IC + icptg - 1) / icptg;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline_ic);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, ic_groups, OH, OW, icptg, KH, KW);
+
+        return 1;
+    }
 
     if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
