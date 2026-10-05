@@ -61,6 +61,9 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# ConvRot8 is a CUDA/cuBLAS-only wrapper around the AITK reference API.
+# Keep the CUDA-only translation unit out of the shared HIP glob.
+list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX ".*/convrot8\\.cu$")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")

@@ -2050,6 +2050,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_train_back(params, tensor);
             } break;
+        case GGML_OP_CONVROT8:
+        case GGML_OP_CONVROT8_BACK:
+            GGML_ABORT("ConvRot8 is CUDA-only; select a CUDA backend");
         case GGML_OP_SSM_CONV:
             {
                 ggml_compute_forward_ssm_conv(params, tensor);

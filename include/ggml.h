@@ -605,6 +605,10 @@ extern "C" {
         GGML_OP_FLASH_ATTN_TRAIN,
         GGML_OP_FLASH_ATTN_TRAIN_BACK,
 
+        // HOT-Step ConvRot8 CUDA-only training op pair
+        GGML_OP_CONVROT8,
+        GGML_OP_CONVROT8_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2611,6 +2615,24 @@ extern "C" {
             struct ggml_tensor  * fwd,
             struct ggml_tensor  * dfwd,
             float                 scale);
+
+    // CUDA-only ConvRot8.  Weight is [input_width, output_width] I8,
+    // activation is [input_width, rows] F32, scales are [output_width] F32,
+    // optional bias is [output_width] F32.  Output and input gradient are F32;
+    // only activation receives a backward gradient.
+    GGML_API struct ggml_tensor * ggml_convrot8(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight_i8,
+            struct ggml_tensor  * x_f32,
+            struct ggml_tensor  * scales_f32,
+            struct ggml_tensor  * bias_f32,
+            int                   rotation_size,
+            bool                  compute_bf16);
+
+    GGML_API struct ggml_tensor * ggml_convrot8_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dy_f32,
+            struct ggml_tensor  * forward);
 
     // Shared packing arithmetic for the backward's three regions.
     GGML_API void ggml_flash_attn_train_back_offsets(

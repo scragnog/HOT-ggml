@@ -1103,10 +1103,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     // HOT-Step patch: flash-attn-train
     "FLASH_ATTN_TRAIN",
     "FLASH_ATTN_TRAIN_BACK",
+
+    "CONVROT8",
+    "CONVROT8_BACK",
 };
 
-// HOT-Step patch: flash-attn-train (101 -> 103)
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+// HOT-Step patch: flash-attn-train + HOT-Step ConvRot8 (101 -> 105)
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1223,10 +1226,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     // HOT-Step patch: flash-attn-train
     "flash_attn_train(q,k,v,mask)",
     "flash_attn_train_back(q,k,v,mask,o,do)",
+
+    "convrot8(weight,x,scales,bias)",
+    "convrot8_back(dy,forward)",
 };
 
-// HOT-Step patch: flash-attn-train (101 -> 103)
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+// HOT-Step patch: flash-attn-train + HOT-Step ConvRot8 (101 -> 105)
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5906,6 +5912,68 @@ struct ggml_tensor * ggml_flash_attn_train_back_get_dv(
                         offs_dv);
 }
 
+// HOT-Step ConvRot8 CUDA-only op pair
+static bool ggml_convrot8_valid_rotation(int rotation) {
+    if (rotation == 1) return true;
+    if (rotation < 4 || rotation > 4096) return false;
+    while (rotation > 1) {
+        if (rotation % 4 != 0) return false;
+        rotation /= 4;
+    }
+    return true;
+}
+
+struct ggml_tensor * ggml_convrot8(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight_i8,
+        struct ggml_tensor  * x_f32,
+        struct ggml_tensor  * scales_f32,
+        struct ggml_tensor  * bias_f32,
+        int                   rotation_size,
+        bool                  compute_bf16) {
+    GGML_ASSERT(weight_i8 && x_f32 && scales_f32);
+    GGML_ASSERT(weight_i8->type == GGML_TYPE_I8 && ggml_is_matrix(weight_i8) && ggml_is_contiguous(weight_i8));
+    GGML_ASSERT(x_f32->type == GGML_TYPE_F32 && ggml_is_matrix(x_f32) && ggml_is_contiguous(x_f32));
+    GGML_ASSERT(scales_f32->type == GGML_TYPE_F32 && ggml_is_vector(scales_f32) && ggml_is_contiguous(scales_f32));
+    GGML_ASSERT(!bias_f32 || (bias_f32->type == GGML_TYPE_F32 && ggml_is_vector(bias_f32) && ggml_is_contiguous(bias_f32)));
+    GGML_ASSERT(!(weight_i8->flags & GGML_TENSOR_FLAG_PARAM) &&
+                !(scales_f32->flags & GGML_TENSOR_FLAG_PARAM) &&
+                (!bias_f32 || !(bias_f32->flags & GGML_TENSOR_FLAG_PARAM)) &&
+                "ConvRot8 weight/scales/bias are frozen");
+    GGML_ASSERT(weight_i8->ne[0] == x_f32->ne[0]);
+    GGML_ASSERT(weight_i8->ne[1] == scales_f32->ne[0]);
+    GGML_ASSERT(!bias_f32 || bias_f32->ne[0] == weight_i8->ne[1]);
+    GGML_ASSERT(ggml_convrot8_valid_rotation(rotation_size) && x_f32->ne[0] % rotation_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                      weight_i8->ne[1], x_f32->ne[1]);
+    int32_t params[2] = { rotation_size, compute_bf16 ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op = GGML_OP_CONVROT8;
+    result->src[0] = weight_i8;
+    result->src[1] = x_f32;
+    result->src[2] = scales_f32;
+    result->src[3] = bias_f32;
+    return result;
+}
+
+struct ggml_tensor * ggml_convrot8_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dy_f32,
+        struct ggml_tensor  * forward) {
+    GGML_ASSERT(forward && forward->op == GGML_OP_CONVROT8);
+    GGML_ASSERT(dy_f32 && dy_f32->type == GGML_TYPE_F32 && ggml_is_contiguous(dy_f32) &&
+                ggml_are_same_shape(dy_f32, forward));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                      forward->src[1]->ne[0], forward->src[1]->ne[1]);
+    memcpy(result->op_params, forward->op_params, sizeof(forward->op_params));
+    result->op = GGML_OP_CONVROT8_BACK;
+    result->src[0] = forward->src[0];
+    result->src[1] = dy_f32;
+    result->src[2] = forward->src[2];
+    return result;
+}
+
 // ggml_ssm_conv
 
 struct ggml_tensor * ggml_ssm_conv(
@@ -7609,6 +7677,22 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_FLASH_ATTN_TRAIN_BACK: {
             GGML_ABORT("%s: FLASH_ATTN_TRAIN_BACK is not differentiable", __func__);
+        } break;
+        case GGML_OP_CONVROT8: {
+            const struct ggml_tensor * src3 = tensor->src[3];
+            const size_t isrc3 = src3 ? ggml_hash_find(hash_set, src3) : GGML_HASHSET_FULL;
+            const bool src3_needs_grads = src3 && isrc3 != GGML_HASHSET_FULL &&
+                ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+            GGML_ASSERT(!src0_needs_grads && !src2_needs_grads &&
+                        !src3_needs_grads &&
+                        "ConvRot8 backward only supports activation gradients");
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1,
+                                ggml_convrot8_back(ctx, grad, tensor));
+            }
+        } break;
+        case GGML_OP_CONVROT8_BACK: {
+            GGML_ABORT("%s: CONVROT8_BACK is not differentiable", __func__);
         } break;
         case GGML_OP_NONE: {
             // noop
