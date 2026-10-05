@@ -10696,6 +10696,18 @@ void ggml_compute_forward_win_unpart(
     }
 }
 
+static void ggml_compute_forward_bf16_round(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    const int64_t n = ggml_nelements(dst);
+    const float * src = static_cast<const float *>(src0->data);
+    float * out = static_cast<float *>(dst->data);
+    for (int64_t i = params->ith; i < n; i += params->nth) {
+        out[i] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(src[i]));
+    }
+}
+
 //ggml_compute_forward_unary
 
 void ggml_compute_forward_unary(
@@ -10705,6 +10717,9 @@ void ggml_compute_forward_unary(
     const ggml_unary_op op = ggml_get_unary_op(dst);
 
     switch (op) {
+        case GGML_UNARY_OP_BF16_ROUND:
+            ggml_compute_forward_bf16_round(params, dst);
+            break;
         case GGML_UNARY_OP_ABS:
             {
                 ggml_compute_forward_abs(params, dst);

@@ -636,6 +636,7 @@ extern "C" {
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
 
+        GGML_UNARY_OP_BF16_ROUND,
         GGML_UNARY_OP_COUNT,
     };
 
@@ -2690,6 +2691,10 @@ extern "C" {
             struct ggml_context * ctx,
              struct ggml_tensor * a,
              enum ggml_unary_op op);
+
+    GGML_API struct ggml_tensor * ggml_bf16_round(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_unary_inplace(
         struct ggml_context * ctx,

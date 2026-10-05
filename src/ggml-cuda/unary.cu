@@ -114,6 +114,10 @@ static __device__ __forceinline__ float op_trunc(float x) {
     return trunc(x);
 }
 
+static __device__ __forceinline__ float op_bf16_round(float x) {
+    return __bfloat162float(__float2bfloat16(x));
+}
+
 template <float (*op)(float), typename T>
 static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     ggml_cuda_pdl_lc();
@@ -248,6 +252,10 @@ void ggml_cuda_op_round(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_trunc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_trunc>(ctx, dst);
+}
+
+void ggml_cuda_op_bf16_round(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_unary<op_bf16_round>(ctx, dst);
 }
 
 void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

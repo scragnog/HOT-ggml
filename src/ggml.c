@@ -1259,9 +1259,10 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "BF16_ROUND",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -6348,6 +6349,15 @@ struct ggml_tensor * ggml_unary(
     return ggml_unary_impl(ctx, a, op, false);
 }
 
+struct ggml_tensor * ggml_bf16_round(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    // The CPU/CUDA kernels are contiguous F32 elementwise operations.
+    if (!ggml_is_contiguous(a)) {
+        a = ggml_cont(ctx, a);
+    }
+    return ggml_unary(ctx, a, GGML_UNARY_OP_BF16_ROUND);
+}
+
 struct ggml_tensor * ggml_unary_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -7557,6 +7567,12 @@ static void ggml_compute_backward(
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
         case GGML_OP_UNARY: {
+            if (ggml_get_unary_op(tensor) == GGML_UNARY_OP_BF16_ROUND) {
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_bf16_round(ctx, grad));
+                }
+                break;
+            }
             switch (ggml_get_unary_op(tensor)) {
                 case GGML_UNARY_OP_ABS: {
                     if (src0_needs_grads) {

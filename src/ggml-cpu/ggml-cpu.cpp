@@ -441,6 +441,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_UNARY:
+            if (ggml_get_unary_op(op) == GGML_UNARY_OP_BF16_ROUND) {
+                return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0);
+            }
+            return true;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
