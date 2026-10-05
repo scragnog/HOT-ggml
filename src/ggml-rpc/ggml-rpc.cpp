@@ -358,6 +358,16 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
                        response.major, response.minor, response.patch);
         return false;
     }
+    // HOT-Step: this fork appends ops (GGML_OP_COUNT 105) and marks that with
+    // RPC_PROTO_PATCH_VERSION. A server on any other patch level, stock 7.0.0
+    // included, does not know those ops, so refuse it here rather than fail on
+    // the first graph that uses one.
+    if (response.patch != RPC_PROTO_PATCH_VERSION) {
+        GGML_LOG_ERROR("RPC server %d.%d.%d does not speak this ggml fork's protocol %d.%d.%d\n",
+                       response.major, response.minor, response.patch,
+                       RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION, RPC_PROTO_PATCH_VERSION);
+        return false;
+    }
 
     sock->update_caps(response.conn_caps);
     return true;
