@@ -2041,6 +2041,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 bool masked = t != 0;
                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
             } break;
+        // HOT-Step patch: flash-attn-train
+        case GGML_OP_FLASH_ATTN_TRAIN:
+            {
+                ggml_compute_forward_flash_attn_train(params, tensor);
+            } break;
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            {
+                ggml_compute_forward_flash_attn_train_back(params, tensor);
+            } break;
         case GGML_OP_SSM_CONV:
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
@@ -2431,6 +2440,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
+        // HOT-Step patch: flash-attn-train
+        case GGML_OP_FLASH_ATTN_TRAIN:
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
@@ -3024,6 +3036,27 @@ struct ggml_cplan ggml_graph_plan(
                             cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
                             cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
                         }
+                    } break;
+
+                // HOT-Step patch: flash-attn-train
+                case GGML_OP_FLASH_ATTN_TRAIN:
+                    {
+                        const int64_t D = node->src[0]->ne[0];
+                        // per thread: s tile [BQ*BK] + acc [BQ*D] + m/l/rowmax [3*BQ]
+                        cur += sizeof(float)*n_tasks*(GGML_FA_TRAIN_BQ*GGML_FA_TRAIN_BK
+                                                      + GGML_FA_TRAIN_BQ*D
+                                                      + 3*GGML_FA_TRAIN_BQ
+                                                      + CACHE_LINE_SIZE_F32);
+                    } break;
+                case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+                    {
+                        const int64_t D = node->src[0]->ne[0];
+                        // per thread: P/dS tiles [2*BQ*BK], dQ tile [BQ*D] or
+                        // dK+dV tiles [2*BK*D] (whichever pass is larger), D_i [BQ]
+                        cur += sizeof(float)*n_tasks*(2*GGML_FA_TRAIN_BQ*GGML_FA_TRAIN_BK
+                                                      + MAX(GGML_FA_TRAIN_BQ*D, 2*GGML_FA_TRAIN_BK*D)
+                                                      + GGML_FA_TRAIN_BQ
+                                                      + CACHE_LINE_SIZE_F32);
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

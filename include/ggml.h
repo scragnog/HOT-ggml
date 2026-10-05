@@ -601,6 +601,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // HOT-Step patch: flash-attn-train
+        GGML_OP_FLASH_ATTN_TRAIN,
+        GGML_OP_FLASH_ATTN_TRAIN_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2520,6 +2524,109 @@ extern "C" {
            struct ggml_tensor  * v,
            struct ggml_tensor  * d,
            bool                  masked);
+
+    // HOT-Step patch: flash-attn-train
+    //
+    // Fused attention forward + backward for the DiT trainer.
+    // See docs/plans/fattn-train-spec.md. NOT on the inference path.
+    //
+    // q:    [D, S,    Nh,  B]   f32, nb[0] == sizeof(float)
+    // k:    [D, S_kv, Nkv, B]   f32, Nh % Nkv == 0
+    // v:    [D, S_kv, Nkv, B]   f32, !! not transposed !!
+    // mask: [S_kv, S, m2, m3]   f16 additive (0 or -INF) or NULL,
+    //                           Nh % m2 == 0, B % m3 == 0
+    //
+    // result: ONE contiguous 1-D f32 tensor packing
+    //   O   [D, Nh, S, B]  at byte offset 0
+    //   LSE [Nh, S, B]     at byte offset ggml_flash_attn_train_lse_offset(q)
+    // Use the view helpers below; never hand-compute the offsets.
+    //
+    // Deliberate deviation from ggml_soft_max_ext: a query row whose every key
+    // is masked yields O = 0 and LSE = 0 (soft_max emits NaN there). The packed
+    // tensor must stay finite because ggml builds its gradient as
+    // ggml_scale(packed, 0.0f), and 0 * NaN == NaN would poison dO.
+    //
+    // Load-bearing invariant: that ggml_scale must never run in place. It would
+    // zero O and LSE before GGML_OP_FLASH_ATTN_TRAIN_BACK reads them from
+    // src[4] -- silently wrong gradients, no crash, no NaN. Safe today only
+    // because `packed` always has >= 1 view and >= 3 children, so ggml-alloc's
+    // reuse test (n_children == 1 && n_views == 0) never fires.
+    GGML_API struct ggml_tensor * ggml_flash_attn_train(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale);
+
+    // HOT-Step patch: flash-attn-train
+    //
+    // Arithmetic precision of the two ops' matmuls, stored in op_params slot 3
+    // (slots 0-2 are scale + the two reserved fields), exactly as
+    // ggml_flash_attn_ext_set_prec does.
+    //
+    //   GGML_PREC_DEFAULT (0)  TF32 tensor-core kernels where the backend has
+    //                          them (CUDA sm_80+), the f32 path everywhere else
+    //   GGML_PREC_F32          strict f32, always
+    //
+    // Accepts either op. GGML_PREC_DEFAULT is 0 and ggml_new_tensor zeroes
+    // op_params, so a graph built before this flag existed reads as the default.
+    //
+    // PRECISION IS A PROPERTY OF THE OP PAIR. The backward recomputes S and
+    // reuses the forward's LSE, so it must round the way the forward did or
+    // every row's gradient carries an inconsistency that is not rounding.
+    // ggml_compute_backward copies the flag across for exactly that reason;
+    // anything building the back node by hand must do the same.
+    //
+    // The CPU implementations ignore the flag and always compute in f32: they
+    // are the correctness oracle, and an oracle that moves with the thing it
+    // is checking is not one.
+    GGML_API void           ggml_flash_attn_train_set_prec(struct ggml_tensor * a, enum ggml_prec prec);
+    GGML_API enum ggml_prec ggml_flash_attn_train_get_prec(const struct ggml_tensor * a);
+
+    // Shared packing arithmetic -- the constructor, both view helpers and every
+    // backend impl go through these. Exported so the parity tool can too.
+    GGML_API size_t  ggml_flash_attn_train_lse_offset(const struct ggml_tensor * q);
+    GGML_API int64_t ggml_flash_attn_train_nelements (const struct ggml_tensor * q);
+
+    // [D, Nh, S, B] contiguous view of the O region -- drop-in for the
+    // dit_attn_f32 result.
+    GGML_API struct ggml_tensor * ggml_flash_attn_train_get_o  (struct ggml_context * ctx, struct ggml_tensor * packed);
+    // [Nh, S, B] contiguous view of the LSE region (diagnostics/tests only --
+    // the backward reads the region directly off `packed`).
+    GGML_API struct ggml_tensor * ggml_flash_attn_train_get_lse(struct ggml_context * ctx, struct ggml_tensor * packed);
+
+    // q, k, v, mask: exactly the tensors passed to ggml_flash_attn_train
+    // fwd:  the packed forward OUTPUT tensor  (supplies O and LSE)
+    // dfwd: the gradient of that packed tensor (dO lives in its O region; the
+    //       LSE region is zero and is not read)
+    //
+    // result: ONE contiguous 1-D f32 tensor packing dQ | dK | dV.
+    GGML_API struct ggml_tensor * ggml_flash_attn_train_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * fwd,
+            struct ggml_tensor  * dfwd,
+            float                 scale);
+
+    // Shared packing arithmetic for the backward's three regions.
+    GGML_API void ggml_flash_attn_train_back_offsets(
+            const struct ggml_tensor * q,
+            const struct ggml_tensor * k,
+            const struct ggml_tensor * v,
+            size_t  * offs_dq,
+            size_t  * offs_dk,
+            size_t  * offs_dv,
+            int64_t * nelem);
+
+    // Views with the same ne as q / k / v respectively. Each recovers all three
+    // shapes from the back node itself (packed->src[0..2]).
+    GGML_API struct ggml_tensor * ggml_flash_attn_train_back_get_dq(struct ggml_context * ctx, struct ggml_tensor * packed);
+    GGML_API struct ggml_tensor * ggml_flash_attn_train_back_get_dk(struct ggml_context * ctx, struct ggml_tensor * packed);
+    GGML_API struct ggml_tensor * ggml_flash_attn_train_back_get_dv(struct ggml_context * ctx, struct ggml_tensor * packed);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,

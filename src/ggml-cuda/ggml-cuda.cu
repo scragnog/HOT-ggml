@@ -26,6 +26,8 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+// HOT-Step patch: flash-attn-train
+#include "ggml-cuda/fattn-train.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2396,6 +2398,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
+            break;
+        // HOT-Step patch: flash-attn-train
+        case GGML_OP_FLASH_ATTN_TRAIN:
+            ggml_cuda_flash_attn_train(ctx, dst);
+            break;
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            ggml_cuda_flash_attn_train_back(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -5633,6 +5642,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        // HOT-Step patch: flash-attn-train
+        // Honest capability reporting matters here (spec 9.8): a `false` is
+        // not a failure, it is a SILENT fallback to the CPU backend that the
+        // trainer's scheduler registers alongside the GPU one -- correct,
+        // unusably slow, and with low VRAM and a quiet NVML tripwire, i.e. it
+        // looks like a pass. Both directions have CUDA kernels now, and both
+        // report their real shape/type capability rather than a blanket yes.
+        case GGML_OP_FLASH_ATTN_TRAIN:
+            return ggml_cuda_flash_attn_train_supported(op);
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            return ggml_cuda_flash_attn_train_back_supported(op);
 
         default:
             return false;
@@ -5813,6 +5833,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // HOT-Step patch: flash-attn-train -- which arithmetic the last
+    // FLASH_ATTN_TRAIN{,_BACK} launch actually used, so the parity tool can
+    // assert the kernel that RAN instead of restating the flag it asked for.
+    // const char * (*)(int dir), dir 0 = forward, 1 = backward.
+    if (strcmp(name, "ggml_backend_cuda_fattn_train_last_prec") == 0) {
+        return (void *)ggml_cuda_fattn_train_last_prec;
     }
     return nullptr;
 }

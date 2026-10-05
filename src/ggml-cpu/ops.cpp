@@ -9751,6 +9751,517 @@ void ggml_compute_forward_flash_attn_back(
     }
 }
 
+// HOT-Step patch: flash-attn-train
+// ggml_compute_forward_flash_attn_train / _back
+//
+// CPU reference implementation of GGML_OP_FLASH_ATTN_TRAIN{,_BACK}. Plain f32,
+// clarity over speed: correctness oracle for the CUDA kernels and the fallback
+// when no GPU backend claims the op. See docs/plans/fattn-train-spec.md.
+//
+// Deliberate deviation from ggml_soft_max_ext (spec 4.4): a query row whose
+// every key is masked yields O = 0 and LSE = 0, where soft_max emits NaN. The
+// packed forward tensor must stay finite -- ggml builds its gradient as
+// ggml_scale(packed, 0.0f) and 0 * NaN == NaN would poison dO.
+//
+// Load-bearing invariant (spec 5.2): that ggml_scale must never run in place;
+// it would zero O and LSE before the backward reads them from src[4]. The
+// backward asserts it is not aliasing the forward, which catches the adjacent
+// hazard.
+
+static inline float ggml_fa_train_mask_val(
+        const ggml_fp16_t * mp,
+        int64_t mne0, int64_t mne1, int64_t mne2, int64_t mne3,
+        int64_t h, int64_t b, int64_t i, int64_t j) {
+    if (mp == NULL) {
+        return 0.0f;
+    }
+    // modulo, not divide -- ggml_soft_max_ext's broadcast rule (spec 3.4)
+    const int64_t idx = j + mne0*(i + mne1*((h % mne2) + mne2*(b % mne3)));
+    return GGML_CPU_FP16_TO_FP32(mp[idx]);
+}
+
+static inline float ggml_fa_train_dot(const float * a, const float * b, int64_t n) {
+    float s = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        s += a[i]*b[i];
+    }
+    return s;
+}
+
+static void ggml_compute_forward_flash_attn_train_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+
+    const int64_t D    = q->ne[0];
+    const int64_t S    = q->ne[1];
+    const int64_t Nh   = q->ne[2];
+    const int64_t Bn   = q->ne[3];
+    const int64_t S_kv = k->ne[1];
+    const int64_t Nkv  = k->ne[2];
+    const int64_t G    = Nh/Nkv;
+
+    GGML_ASSERT(Nkv > 0 && Nh % Nkv == 0);
+    GGML_ASSERT(ggml_nelements(dst) == ggml_flash_attn_train_nelements(q));
+
+    float scale = 1.0f;
+    float rsv1  = 0.0f;
+    float rsv2  = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&rsv1,  (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&rsv2,  (const float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(rsv1 == 0.0f && rsv2 == 0.0f);   // reserved: max_bias, logit_softcap
+
+    // HOT-Step patch: flash-attn-train
+    // op_params slot 3 (ggml_flash_attn_train_set_prec) is IGNORED here on
+    // purpose: this implementation always computes in f32, in both precision
+    // modes. It is the correctness oracle the CUDA kernels are measured
+    // against, and an oracle that moves when the mode moves cannot attribute a
+    // difference to the kernel.
+
+    const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data : NULL;
+    const int64_t mne0 = mask ? mask->ne[0] : 1;
+    const int64_t mne1 = mask ? mask->ne[1] : 1;
+    const int64_t mne2 = mask ? mask->ne[2] : 1;
+    const int64_t mne3 = mask ? mask->ne[3] : 1;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const size_t  offs_lse = ggml_flash_attn_train_lse_offset(q);
+    const int64_t n_o      = D*Nh*S*Bn;
+
+    float * const o_data   = (float *) dst->data;
+    float * const lse_data = (float *) ((char *) dst->data + offs_lse);
+
+    // Spec 2.2: zero the alignment gap between the O and LSE regions. No kernel
+    // would otherwise write it, ggml-alloc reuses buffers, and the packed
+    // tensor's gradient is ggml_scale(packed, 0.0f) -- 0 * inf/NaN is NaN.
+    // Zero-width at every production geometry, which is exactly why it ships.
+    if (ith == 0) {
+        const size_t gap_beg = (size_t) n_o * sizeof(float);
+        if (offs_lse > gap_beg) {
+            memset((char *) dst->data + gap_beg, 0, offs_lse - gap_beg);
+        }
+    }
+
+    const int64_t BQ = GGML_FA_TRAIN_BQ;
+    const int64_t BK = GGML_FA_TRAIN_BK;
+
+    // per-thread scratch, laid out to match ggml_graph_plan's estimate
+    const size_t  slab = (size_t) (BQ*BK + BQ*D + 3*BQ) + CACHE_LINE_SIZE_F32;
+    float * const wd   = (float *) params->wdata + slab*(size_t) ith;
+    float * const st   = wd;              // [BQ*BK] score tile
+    float * const acc  = st  + BQ*BK;     // [BQ*D]  unnormalised output
+    float * const mrun = acc + BQ*D;      // [BQ]    running row max
+    float * const lrun = mrun + BQ;       // [BQ]    running sum of exp
+                                          // [BQ]    reserved (rowmax scratch)
+
+    // work items: one query tile per (h, b, tile)
+    const int64_t ntq = (S + BQ - 1)/BQ;
+    const int64_t nr  = Nh*Bn*ntq;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t it = ir % ntq;
+        const int64_t hb = ir / ntq;
+        const int64_t h  = hb % Nh;
+        const int64_t b  = hb / Nh;
+        const int64_t hk = h/G;
+
+        const int64_t i0 = it*BQ;
+        const int64_t i1 = MIN(i0 + BQ, S);
+        const int64_t nq = i1 - i0;
+
+        for (int64_t ii = 0; ii < nq; ++ii) {
+            mrun[ii] = -INFINITY;
+            lrun[ii] = 0.0f;
+            memset(acc + ii*D, 0, (size_t) D*sizeof(float));
+        }
+
+        for (int64_t j0 = 0; j0 < S_kv; j0 += BK) {
+            const int64_t j1 = MIN(j0 + BK, S_kv);
+            const int64_t nk = j1 - j0;
+
+            // scores for the tile; a masked entry stays exactly -INF whatever
+            // the scale, because the mask is additive AFTER the scale.
+            bool any_finite = false;
+            for (int64_t ii = 0; ii < nq; ++ii) {
+                const float * qi = (const float *) ((const char *) q->data
+                        + (i0 + ii)*q->nb[1] + h*q->nb[2] + b*q->nb[3]);
+                float * srow = st + ii*BK;
+                for (int64_t jj = 0; jj < nk; ++jj) {
+                    const float mv = ggml_fa_train_mask_val(mp, mne0, mne1, mne2, mne3, h, b, i0 + ii, j0 + jj);
+                    if (mv == -INFINITY) {
+                        srow[jj] = -INFINITY;
+                        continue;
+                    }
+                    const float * kj = (const float *) ((const char *) k->data
+                            + (j0 + jj)*k->nb[1] + hk*k->nb[2] + b*k->nb[3]);
+                    srow[jj]   = scale*ggml_fa_train_dot(qi, kj, D) + mv;
+                    any_finite = true;
+                }
+            }
+
+            // whole tile dead (sliding window makes most tiles dead at large S)
+            if (!any_finite) {
+                continue;
+            }
+
+            for (int64_t ii = 0; ii < nq; ++ii) {
+                const float * srow = st + ii*BK;
+
+                float rowmax = -INFINITY;
+                for (int64_t jj = 0; jj < nk; ++jj) {
+                    if (srow[jj] > rowmax) {
+                        rowmax = srow[jj];
+                    }
+                }
+
+                const float m_new = MAX(mrun[ii], rowmax);
+                if (m_new == -INFINITY) {
+                    continue;   // still nothing seen on this row
+                }
+
+                // exp(-INF - finite) == 0.0f exactly in IEEE-754
+                const float corr = expf(mrun[ii] - m_new);
+                float * a = acc + ii*D;
+                lrun[ii] *= corr;
+                if (corr != 1.0f) {
+                    for (int64_t d = 0; d < D; ++d) {
+                        a[d] *= corr;
+                    }
+                }
+
+                for (int64_t jj = 0; jj < nk; ++jj) {
+                    if (srow[jj] == -INFINITY) {
+                        continue;   // p is exactly 0.0f -- contributes nothing
+                    }
+                    const float p = expf(srow[jj] - m_new);
+                    if (p == 0.0f) {
+                        continue;
+                    }
+                    lrun[ii] += p;
+                    const float * vj = (const float *) ((const char *) v->data
+                            + (j0 + jj)*v->nb[1] + hk*v->nb[2] + b*v->nb[3]);
+                    for (int64_t d = 0; d < D; ++d) {
+                        a[d] += p*vj[d];
+                    }
+                }
+
+                mrun[ii] = m_new;
+            }
+        }
+
+        for (int64_t ii = 0; ii < nq; ++ii) {
+            const int64_t s_idx = i0 + ii;
+            float * const orow  = o_data + D*(h + Nh*(s_idx + S*b));
+            const float * a     = acc + ii*D;
+            if (lrun[ii] > 0.0f) {
+                for (int64_t d = 0; d < D; ++d) {
+                    orow[d] = a[d]/lrun[ii];
+                }
+                lse_data[h + Nh*(s_idx + S*b)] = mrun[ii] + logf(lrun[ii]);
+            } else {
+                // spec 4.4: fully-masked row -- defined, finite, NOT NaN
+                for (int64_t d = 0; d < D; ++d) {
+                    orow[d] = 0.0f;
+                }
+                lse_data[h + Nh*(s_idx + S*b)] = 0.0f;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_flash_attn_train(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q = dst->src[0];
+
+    switch (q->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_flash_attn_train_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// HOT-Step patch: flash-attn-train
+static void ggml_compute_forward_flash_attn_train_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * fwd  = dst->src[4];
+    const ggml_tensor * dfwd = dst->src[5];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    GGML_ASSERT(fwd->type == GGML_TYPE_F32 && ggml_is_contiguous(fwd));
+    GGML_ASSERT(dfwd->type == GGML_TYPE_F32 && ggml_is_contiguous(dfwd));
+    // spec 5.2: the back op must never alias the forward packed tensor
+    GGML_ASSERT(dst->data != fwd->data);
+
+    const int64_t D    = q->ne[0];
+    const int64_t S    = q->ne[1];
+    const int64_t Nh   = q->ne[2];
+    const int64_t Bn   = q->ne[3];
+    const int64_t S_kv = k->ne[1];
+    const int64_t Nkv  = k->ne[2];
+    const int64_t G    = Nh/Nkv;
+
+    GGML_ASSERT(Nkv > 0 && Nh % Nkv == 0);
+
+    float scale = 1.0f;
+    float rsv1  = 0.0f;
+    float rsv2  = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&rsv1,  (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&rsv2,  (const float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(rsv1 == 0.0f && rsv2 == 0.0f);
+
+    // HOT-Step patch: flash-attn-train
+    // op_params slot 3 (the precision flag) is IGNORED here, same as in the
+    // forward: the CPU path always computes in f32 so it stays a fixed oracle.
+
+    const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data : NULL;
+    const int64_t mne0 = mask ? mask->ne[0] : 1;
+    const int64_t mne1 = mask ? mask->ne[1] : 1;
+    const int64_t mne2 = mask ? mask->ne[2] : 1;
+    const int64_t mne3 = mask ? mask->ne[3] : 1;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    size_t  offs_dq, offs_dk, offs_dv;
+    int64_t nelem;
+    ggml_flash_attn_train_back_offsets(q, k, v, &offs_dq, &offs_dk, &offs_dv, &nelem);
+    GGML_ASSERT(ggml_nelements(dst) == nelem);
+
+    float * const dq_data = (float *) ((char *) dst->data + offs_dq);
+    float * const dk_data = (float *) ((char *) dst->data + offs_dk);
+    float * const dv_data = (float *) ((char *) dst->data + offs_dv);
+
+    const float * const o_data   = (const float *) fwd->data;
+    const float * const lse_data = (const float *) ((const char *) fwd->data + ggml_flash_attn_train_lse_offset(q));
+    const float * const do_data  = (const float *) dfwd->data;   // dO in the O region;
+                                                                 // the LSE region is ignored (spec 9.7)
+
+    // Spec 3.2: zero the two alignment gaps, same rule as the forward.
+    if (ith == 0) {
+        const int64_t n_q = D*S*Nh*Bn;
+        const int64_t n_k = D*S_kv*Nkv*Bn;
+        const size_t  g0  = (size_t) n_q*sizeof(float);
+        if (offs_dk > g0) {
+            memset((char *) dst->data + g0, 0, offs_dk - g0);
+        }
+        const size_t g1 = offs_dk + (size_t) n_k*sizeof(float);
+        if (offs_dv > g1) {
+            memset((char *) dst->data + g1, 0, offs_dv - g1);
+        }
+    }
+
+    const int64_t BQ = GGML_FA_TRAIN_BQ;
+    const int64_t BK = GGML_FA_TRAIN_BK;
+
+    // per-thread scratch, laid out to match ggml_graph_plan's estimate
+    const size_t  big  = (size_t) MAX(BQ*D, 2*BK*D);
+    const size_t  slab = (size_t) (2*BQ*BK) + big + (size_t) BQ + CACHE_LINE_SIZE_F32;
+    float * const wd   = (float *) params->wdata + slab*(size_t) ith;
+    float * const tile = wd + 2*BQ*BK;      // dQ tile [BQ*D], or dK|dV tiles [2*BK*D]
+    float * const di   = tile + big;        // [BQ] the row identity sum_d dO*O
+
+    // ---- pass A: dQ. One work item per (h, b, query tile). ----
+    {
+        const int64_t ntq = (S + BQ - 1)/BQ;
+        const int64_t nr  = Nh*Bn*ntq;
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t it = ir % ntq;
+            const int64_t hb = ir / ntq;
+            const int64_t h  = hb % Nh;
+            const int64_t b  = hb / Nh;
+            const int64_t hk = h/G;
+
+            const int64_t i0 = it*BQ;
+            const int64_t i1 = MIN(i0 + BQ, S);
+            const int64_t nq = i1 - i0;
+
+            for (int64_t ii = 0; ii < nq; ++ii) {
+                const int64_t base = D*(h + Nh*((i0 + ii) + S*b));
+                di[ii] = ggml_fa_train_dot(do_data + base, o_data + base, D);
+            }
+            memset(tile, 0, (size_t) (nq*D)*sizeof(float));
+
+            for (int64_t j0 = 0; j0 < S_kv; j0 += BK) {
+                const int64_t j1 = MIN(j0 + BK, S_kv);
+
+                for (int64_t ii = 0; ii < nq; ++ii) {
+                    const int64_t i   = i0 + ii;
+                    const float * qi  = (const float *) ((const char *) q->data
+                            + i*q->nb[1] + h*q->nb[2] + b*q->nb[3]);
+                    const float * doi = do_data + D*(h + Nh*(i + S*b));
+                    const float   lse = lse_data[h + Nh*(i + S*b)];
+                    float * dqi = tile + ii*D;
+
+                    for (int64_t j = j0; j < j1; ++j) {
+                        const float mv = ggml_fa_train_mask_val(mp, mne0, mne1, mne2, mne3, h, b, i, j);
+                        if (mv == -INFINITY) {
+                            continue;   // P is exactly 0.0f -> dS exactly 0.0f
+                        }
+                        const float * kj = (const float *) ((const char *) k->data
+                                + j*k->nb[1] + hk*k->nb[2] + b*k->nb[3]);
+                        const float * vj = (const float *) ((const char *) v->data
+                                + j*v->nb[1] + hk*v->nb[2] + b*v->nb[3]);
+
+                        const float s  = scale*ggml_fa_train_dot(qi, kj, D) + mv;
+                        const float p  = expf(s - lse);
+                        if (p == 0.0f) {
+                            continue;
+                        }
+                        const float dp = ggml_fa_train_dot(doi, vj, D);
+                        const float ds = p*(dp - di[ii]);
+                        const float c  = scale*ds;
+                        for (int64_t d = 0; d < D; ++d) {
+                            dqi[d] += c*kj[d];
+                        }
+                    }
+                }
+            }
+
+            for (int64_t ii = 0; ii < nq; ++ii) {
+                float * out = dq_data + D*((i0 + ii) + S*(h + Nh*b));
+                memcpy(out, tile + ii*D, (size_t) D*sizeof(float));
+            }
+        }
+    }
+
+    // ---- pass B: dK, dV. One work item per (hk, b, kv tile). ----
+    // Reads only forward tensors, writes only regions pass A never touches, so
+    // no barrier is needed between the two passes.
+    {
+        const int64_t ntk = (S_kv + BK - 1)/BK;
+        const int64_t nr  = Nkv*Bn*ntk;
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t it = ir % ntk;
+            const int64_t hb = ir / ntk;
+            const int64_t hk = hb % Nkv;
+            const int64_t b  = hb / Nkv;
+
+            const int64_t j0 = it*BK;
+            const int64_t j1 = MIN(j0 + BK, S_kv);
+            const int64_t nk = j1 - j0;
+
+            float * const dkt = tile;             // [nk*D]
+            float * const dvt = tile + BK*D;      // [nk*D]
+            memset(dkt, 0, (size_t) (nk*D)*sizeof(float));
+            memset(dvt, 0, (size_t) (nk*D)*sizeof(float));
+
+            // deterministic order: query heads ascending, then query tiles
+            for (int64_t g = 0; g < G; ++g) {
+                const int64_t h = hk*G + g;
+
+                for (int64_t i00 = 0; i00 < S; i00 += BQ) {
+                    const int64_t i11 = MIN(i00 + BQ, S);
+
+                    for (int64_t ii = 0; ii < i11 - i00; ++ii) {
+                        const int64_t base = D*(h + Nh*((i00 + ii) + S*b));
+                        di[ii] = ggml_fa_train_dot(do_data + base, o_data + base, D);
+                    }
+
+                    for (int64_t ii = 0; ii < i11 - i00; ++ii) {
+                        const int64_t i   = i00 + ii;
+                        const float * qi  = (const float *) ((const char *) q->data
+                                + i*q->nb[1] + h*q->nb[2] + b*q->nb[3]);
+                        const float * doi = do_data + D*(h + Nh*(i + S*b));
+                        const float   lse = lse_data[h + Nh*(i + S*b)];
+
+                        for (int64_t jj = 0; jj < nk; ++jj) {
+                            const int64_t j = j0 + jj;
+                            const float mv = ggml_fa_train_mask_val(mp, mne0, mne1, mne2, mne3, h, b, i, j);
+                            if (mv == -INFINITY) {
+                                continue;   // exactly zero contribution
+                            }
+                            const float * kj = (const float *) ((const char *) k->data
+                                    + j*k->nb[1] + hk*k->nb[2] + b*k->nb[3]);
+                            const float * vj = (const float *) ((const char *) v->data
+                                    + j*v->nb[1] + hk*v->nb[2] + b*v->nb[3]);
+
+                            const float s = scale*ggml_fa_train_dot(qi, kj, D) + mv;
+                            const float p = expf(s - lse);
+                            if (p == 0.0f) {
+                                continue;
+                            }
+                            const float dp = ggml_fa_train_dot(doi, vj, D);
+                            const float ds = p*(dp - di[ii]);
+                            const float c  = scale*ds;
+
+                            float * dkj = dkt + jj*D;
+                            float * dvj = dvt + jj*D;
+                            for (int64_t d = 0; d < D; ++d) {
+                                dvj[d] += p*doi[d];
+                                dkj[d] += c*qi[d];
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (int64_t jj = 0; jj < nk; ++jj) {
+                const int64_t off = D*((j0 + jj) + S_kv*(hk + Nkv*b));
+                memcpy(dk_data + off, dkt + jj*D, (size_t) D*sizeof(float));
+                memcpy(dv_data + off, dvt + jj*D, (size_t) D*sizeof(float));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_flash_attn_train_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q = dst->src[0];
+
+    switch (q->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_flash_attn_train_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_ssm_conv
 
 static void ggml_compute_forward_ssm_conv_f32(

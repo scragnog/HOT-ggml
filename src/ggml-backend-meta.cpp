@@ -1015,6 +1015,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            // HOT-Step patch: flash-attn-train
+            case GGML_OP_FLASH_ATTN_TRAIN:
+            case GGML_OP_FLASH_ATTN_TRAIN_BACK: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_SSM_CONV: {
                 split_state = handle_ssm_conv(src_ss);
             } break;

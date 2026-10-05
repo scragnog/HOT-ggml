@@ -22,6 +22,12 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 // Work buffer size for im2col operations in CONV2D
 #define GGML_IM2COL_WORK_SIZE (16 * 1024 * 1024)
 
+// HOT-Step patch: flash-attn-train
+// CPU tile sizes for GGML_OP_FLASH_ATTN_TRAIN{,_BACK}. Shared with
+// ggml_graph_plan's work-size estimate -- keep the two in step.
+#define GGML_FA_TRAIN_BQ 16
+#define GGML_FA_TRAIN_BK 64
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -96,6 +102,9 @@ void ggml_compute_forward_flash_attn_back(
         const struct ggml_compute_params * params,
         const bool masked,
         struct ggml_tensor * dst);
+// HOT-Step patch: flash-attn-train
+void ggml_compute_forward_flash_attn_train(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_flash_attn_train_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ssm_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ssm_scan(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_win_part(const struct ggml_compute_params * params, struct ggml_tensor * dst);

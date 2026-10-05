@@ -1099,9 +1099,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    // HOT-Step patch: flash-attn-train
+    "FLASH_ATTN_TRAIN",
+    "FLASH_ATTN_TRAIN_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+// HOT-Step patch: flash-attn-train (101 -> 103)
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1219,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    // HOT-Step patch: flash-attn-train
+    "flash_attn_train(q,k,v,mask)",
+    "flash_attn_train_back(q,k,v,mask,o,do)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+// HOT-Step patch: flash-attn-train (101 -> 103)
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5654,6 +5664,248 @@ struct ggml_tensor * ggml_flash_attn_back(
     return result;
 }
 
+// HOT-Step patch: flash-attn-train
+// ggml_flash_attn_train / ggml_flash_attn_train_back
+//
+// Fused attention forward+backward for the DiT trainer. See
+// docs/plans/fattn-train-spec.md -- section numbers referenced below.
+
+// Spec 2.2 packing: O [D,Nh,S,B] at 0, LSE [Nh,S,B] at a 128-byte aligned
+// offset. The 128-byte pad (rather than upstream's GGML_MEM_ALIGN) is
+// deliberate, for CUDA buffer alignment. Every consumer -- constructor, view
+// helpers, CPU impl, CUDA impl, tests -- MUST go through these two helpers.
+size_t ggml_flash_attn_train_lse_offset(const struct ggml_tensor * q) {
+    const int64_t n_o = q->ne[0]*q->ne[1]*q->ne[2]*q->ne[3];
+    return GGML_PAD((size_t) n_o * sizeof(float), 128);
+}
+
+int64_t ggml_flash_attn_train_nelements(const struct ggml_tensor * q) {
+    const int64_t n_lse  = q->ne[1]*q->ne[2]*q->ne[3];
+    const size_t  nbytes = ggml_flash_attn_train_lse_offset(q) + (size_t) n_lse * sizeof(float);
+    return (int64_t) (nbytes / sizeof(float));
+}
+
+struct ggml_tensor * ggml_flash_attn_train(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    GGML_ASSERT(k->ne[0] == q->ne[0]);            // D
+    GGML_ASSERT(v->ne[0] == q->ne[0]);            // DV == D (v1 restriction)
+    GGML_ASSERT(v->ne[1] == k->ne[1]);            // S_kv
+    GGML_ASSERT(v->ne[2] == k->ne[2]);            // Nkv
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);        // GQA group size G = Nh/Nkv
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == k->ne[1]);     // S_kv
+        GGML_ASSERT(mask->ne[1] >= q->ne[1]);     // >= S, as soft_max_ext allows
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+    }
+    // Spec 9.4: the VIEW backward hands the O view's nb1..nb3 and offset to
+    // ggml_acc_impl, which stores them as int32_t. The binding value is the O
+    // view's nb[3] = 4*D*Nh*S -- NOT the packed tensor's total size, and NOT
+    // batch-dependent. 49 MB at D=128, Nh=32, S=3000; overflow needs S ~ 131k.
+    GGML_ASSERT(4 * q->ne[0] * q->ne[2] * q->ne[1] < INT32_MAX);
+
+    const int64_t nelem = ggml_flash_attn_train_nelements(q);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelem);
+
+    float params[] = { scale, 0.0f /* reserved: max_bias */, 0.0f /* reserved: softcap */ };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_TRAIN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+
+    return result;
+}
+
+// HOT-Step patch: flash-attn-train
+//
+// op_params slot 3, the ggml_flash_attn_ext_set_prec arrangement: slots 0-2 are
+// scale + the two reserved floats, so 3 is free and means the same thing here.
+// Both ops accept it -- the flag is a property of the PAIR (see ggml.h, and the
+// inheritance line in ggml_compute_backward).
+void ggml_flash_attn_train_set_prec(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_TRAIN || a->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    ggml_set_op_params_i32(a, 3, (int32_t) prec);
+}
+
+enum ggml_prec ggml_flash_attn_train_get_prec(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_TRAIN || a->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
+}
+
+struct ggml_tensor * ggml_flash_attn_train_get_o(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN);
+    const struct ggml_tensor * q = packed->src[0];
+    const int64_t D  = q->ne[0];
+    const int64_t S  = q->ne[1];
+    const int64_t Nh = q->ne[2];
+    const int64_t B  = q->ne[3];
+    return ggml_view_4d(ctx, packed, D, Nh, S, B,
+                        sizeof(float)*D,
+                        sizeof(float)*D*Nh,
+                        sizeof(float)*D*Nh*S,
+                        0);
+}
+
+struct ggml_tensor * ggml_flash_attn_train_get_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN);
+    const struct ggml_tensor * q = packed->src[0];
+    const int64_t S  = q->ne[1];
+    const int64_t Nh = q->ne[2];
+    const int64_t B  = q->ne[3];
+    return ggml_view_3d(ctx, packed, Nh, S, B,
+                        sizeof(float)*Nh,
+                        sizeof(float)*Nh*S,
+                        ggml_flash_attn_train_lse_offset(q));
+}
+
+// Spec 3.2 packing: dQ | dK | dV, each contiguous in its source tensor's own
+// logical order (the sources are permuted views; the gradients are dense).
+void ggml_flash_attn_train_back_offsets(
+        const struct ggml_tensor * q,
+        const struct ggml_tensor * k,
+        const struct ggml_tensor * v,
+        size_t  * offs_dq,
+        size_t  * offs_dk,
+        size_t  * offs_dv,
+        int64_t * nelem) {
+    const int64_t n_q = q->ne[0]*q->ne[1]*q->ne[2]*q->ne[3];
+    const int64_t n_k = k->ne[0]*k->ne[1]*k->ne[2]*k->ne[3];
+    const int64_t n_v = v->ne[0]*v->ne[1]*v->ne[2]*v->ne[3];
+
+    const size_t o_dq = 0;
+    const size_t o_dk = GGML_PAD((size_t) n_q * sizeof(float), 128);
+    const size_t o_dv = o_dk + GGML_PAD((size_t) n_k * sizeof(float), 128);
+    const size_t end  = o_dv + (size_t) n_v * sizeof(float);
+
+    if (offs_dq) { *offs_dq = o_dq; }
+    if (offs_dk) { *offs_dk = o_dk; }
+    if (offs_dv) { *offs_dv = o_dv; }
+    if (nelem)   { *nelem   = (int64_t) (end / sizeof(float)); }
+}
+
+struct ggml_tensor * ggml_flash_attn_train_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * fwd,
+        struct ggml_tensor  * dfwd,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    GGML_ASSERT(k->ne[0] == q->ne[0]);
+    GGML_ASSERT(v->ne[0] == q->ne[0]);
+    GGML_ASSERT(v->ne[1] == k->ne[1]);
+    GGML_ASSERT(v->ne[2] == k->ne[2]);
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == k->ne[1]);
+        GGML_ASSERT(mask->ne[1] >= q->ne[1]);
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+    }
+    GGML_ASSERT(fwd->type  == GGML_TYPE_F32 && ggml_is_contiguous(fwd));
+    GGML_ASSERT(dfwd->type == GGML_TYPE_F32 && ggml_is_contiguous(dfwd));
+    GGML_ASSERT(ggml_nelements(fwd)  == ggml_flash_attn_train_nelements(q));
+    GGML_ASSERT(ggml_nelements(dfwd) == ggml_nelements(fwd));
+
+    size_t  offs_dq, offs_dk, offs_dv;
+    int64_t nelem;
+    ggml_flash_attn_train_back_offsets(q, k, v, &offs_dq, &offs_dk, &offs_dv, &nelem);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelem);
+
+    float params[] = { scale, 0.0f /* reserved: max_bias */, 0.0f /* reserved: softcap */ };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_TRAIN_BACK;
+    result->src[0] = q;      // slots 0/1/2 are load-bearing: ggml_compute_backward
+    result->src[1] = k;      // only computes isrc0/1/2, and its closing asserts
+    result->src[2] = v;      // are written against those three.
+    result->src[3] = mask;
+    result->src[4] = fwd;
+    result->src[5] = dfwd;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_train_back_get_dq(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+    const struct ggml_tensor * q = packed->src[0];
+    const struct ggml_tensor * k = packed->src[1];
+    const struct ggml_tensor * v = packed->src[2];
+    size_t offs_dq, offs_dk, offs_dv; int64_t nelem;
+    ggml_flash_attn_train_back_offsets(q, k, v, &offs_dq, &offs_dk, &offs_dv, &nelem);
+    const int64_t D = q->ne[0], S = q->ne[1], Nh = q->ne[2], B = q->ne[3];
+    return ggml_view_4d(ctx, packed, D, S, Nh, B,
+                        sizeof(float)*D,
+                        sizeof(float)*D*S,
+                        sizeof(float)*D*S*Nh,
+                        offs_dq);
+}
+
+struct ggml_tensor * ggml_flash_attn_train_back_get_dk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+    const struct ggml_tensor * q = packed->src[0];
+    const struct ggml_tensor * k = packed->src[1];
+    const struct ggml_tensor * v = packed->src[2];
+    size_t offs_dq, offs_dk, offs_dv; int64_t nelem;
+    ggml_flash_attn_train_back_offsets(q, k, v, &offs_dq, &offs_dk, &offs_dv, &nelem);
+    const int64_t D = k->ne[0], S_kv = k->ne[1], Nkv = k->ne[2], B = k->ne[3];
+    return ggml_view_4d(ctx, packed, D, S_kv, Nkv, B,
+                        sizeof(float)*D,
+                        sizeof(float)*D*S_kv,
+                        sizeof(float)*D*S_kv*Nkv,
+                        offs_dk);
+}
+
+struct ggml_tensor * ggml_flash_attn_train_back_get_dv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+    const struct ggml_tensor * q = packed->src[0];
+    const struct ggml_tensor * k = packed->src[1];
+    const struct ggml_tensor * v = packed->src[2];
+    size_t offs_dq, offs_dk, offs_dv; int64_t nelem;
+    ggml_flash_attn_train_back_offsets(q, k, v, &offs_dq, &offs_dk, &offs_dv, &nelem);
+    const int64_t D = v->ne[0], S_kv = v->ne[1], Nkv = v->ne[2], B = v->ne[3];
+    return ggml_view_4d(ctx, packed, D, S_kv, Nkv, B,
+                        sizeof(float)*D,
+                        sizeof(float)*D*S_kv,
+                        sizeof(float)*D*S_kv*Nkv,
+                        offs_dv);
+}
+
 // ggml_ssm_conv
 
 struct ggml_tensor * ggml_ssm_conv(
@@ -7218,6 +7470,56 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        // HOT-Step patch: flash-attn-train
+        case GGML_OP_FLASH_ATTN_TRAIN: {
+            // `tensor` is the PACKED forward output; `grad` is its gradient,
+            // carrying dO in the O region and zeros in the LSE region (spec 5.2).
+            // The forward node's own output rides in as src[4] -- the same trick
+            // SOFT_MAX -> SOFT_MAX_BACK uses when it passes `tensor`.
+            struct ggml_tensor * src3 = tensor->src[3];   // mask, may be NULL
+            if (src0_needs_grads || src1_needs_grads || src2_needs_grads) {
+                float scale = 1.0f;
+                memcpy(&scale, (const float *) tensor->op_params + 0, sizeof(float));
+
+                struct ggml_tensor * bk = ggml_flash_attn_train_back(
+                        ctx, src0, src1, src2, src3, tensor, grad, scale);
+
+                // HOT-Step patch: flash-attn-train -- prec is a property of the
+                // op PAIR: the backward recomputes S and reuses the forward's
+                // LSE, so it must round the same way the forward did. If the two
+                // disagree the recomputed P no longer sums to the stored l and
+                // every row's gradient carries an inconsistency that is not
+                // rounding -- small enough to slip under a tolerance gate, and
+                // wrong in kind. This is the only place that can guarantee it.
+                ggml_flash_attn_train_set_prec(bk, ggml_flash_attn_train_get_prec(tensor));
+
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_flash_attn_train_back_get_dq(ctx, bk));
+                }
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_flash_attn_train_back_get_dk(ctx, bk));
+                }
+                if (src2_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc2, ggml_flash_attn_train_back_get_dv(ctx, bk));
+                }
+            }
+            // Guard on the mask NEEDING a gradient, never on its mere presence:
+            // the trainer passes a mask at every self-attention site
+            // (in.t_sa / in.t_sa_pad, dit-train-graph.h:209), so
+            // GGML_ASSERT(!tensor->src[3]) would abort on every real run.
+            // This is GGML_OP_SOFT_MAX's own pattern, which guards on
+            // src1_needs_grads; ggml_compute_backward only computes
+            // isrc0..isrc2, so isrc3 is derived here.
+            {
+                const size_t isrc3 = src3 ? ggml_hash_find(hash_set, src3) : (size_t) -1;
+                GGML_ASSERT(!(src3 && isrc3 != GGML_HASHSET_FULL &&
+                              ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3]) &&
+                            "backward pass for attention mask not implemented");
+            }
+        } break;
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK: {
+            GGML_ABORT("%s: FLASH_ATTN_TRAIN_BACK is not differentiable", __func__);
         } break;
         case GGML_OP_NONE: {
             // noop
