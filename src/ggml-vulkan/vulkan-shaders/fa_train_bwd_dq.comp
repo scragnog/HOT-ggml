@@ -1,0 +1,74 @@
+#version 450
+
+// HOT-Step patch: flash-attn-train (Vulkan) — GGML_OP_FLASH_ATTN_TRAIN_BACK, pass A.
+// dQ for one query row per cluster, recomputing P from the forward's LSE:
+//   dS_ij = P_ij (dO_i . V_j - dO_i . O_i),  dQ_i = scale * sum_j dS_ij K_j
+
+#include "fa_train_common.glsl"
+
+layout(binding = 4) readonly buffer Fb { float f_d[]; };   // packed forward (O | LSE)
+layout(binding = 5) readonly buffer Gb { float g_d[]; };   // its gradient (dO | unused)
+layout(binding = 6) writeonly buffer Db { float d_d[]; };  // dQ | dK | dV
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint i    = p.row_base + gl_WorkGroupID.x*4 + gl_LocalInvocationID.y;
+    const uint h    = gl_WorkGroupID.y;
+    const uint b    = gl_WorkGroupID.z;
+    const uint E    = p.D/32;
+    const uint hk   = h/(p.Nh/p.Nkv);
+
+    // The two alignment gaps (dQ|dK and dK|dV), same rule as the forward.
+    if (i == 0 && h == 0 && b == 0) {
+        const uint n_q = p.D*p.S*p.Nh*p.B;
+        const uint n_k = p.D*p.S_kv*p.Nkv*p.B;
+        for (uint g = n_q + lane; g < p.dk_off; g += 32) d_d[p.d_off + g] = 0.0;
+        for (uint g = p.dk_off + n_k + lane; g < p.dv_off; g += 32) d_d[p.d_off + g] = 0.0;
+    }
+    if (i >= p.S) {
+        return;
+    }
+
+    float q[FA_MAXE], go[FA_MAXE], dq[FA_MAXE];
+    const uint qb = p.q_off + i*p.q_nb1 + h*p.q_nb2 + b*p.q_nb3;
+    const uint ob = p.D*(h + p.Nh*(i + p.S*b));
+    float di = 0.0;
+    [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+        q[e]  = e < E ? q_d[qb + lane + 32*e] : 0.0;
+        go[e] = e < E ? g_d[p.g_off + ob + lane + 32*e] : 0.0;
+        dq[e] = 0.0;
+        if (e < E) di += go[e]*f_d[p.f_off + ob + lane + 32*e];
+    }
+    di = fa_reduce(di);
+    const float lse = f_d[p.f_off + p.lse_off + h + p.Nh*(i + p.S*b)];
+
+    for (uint j = 0; j < p.S_kv; ++j) {
+        const float mv = fa_mask(h, b, i, j);
+        if (fa_is_neg_inf(mv)) {
+            continue;
+        }
+        const uint kb = p.k_off + j*p.k_nb1 + hk*p.k_nb2 + b*p.k_nb3;
+        float dot = 0.0;
+        [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+            if (e < E) dot += q[e]*k_d[kb + lane + 32*e];
+        }
+        const float pij = exp(p.scale*fa_reduce(dot) + mv - lse);
+        if (pij == 0.0) {
+            continue;
+        }
+        const uint vb = p.v_off + j*p.v_nb1 + hk*p.v_nb2 + b*p.v_nb3;
+        float dp = 0.0;
+        [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+            if (e < E) dp += go[e]*v_d[vb + lane + 32*e];
+        }
+        const float c = p.scale*pij*(fa_reduce(dp) - di);
+        [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+            if (e < E) dq[e] += c*k_d[kb + lane + 32*e];
+        }
+    }
+
+    const uint ob2 = p.d_off + p.D*(i + p.S*(h + p.Nh*b));
+    [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+        if (e < E) d_d[ob2 + lane + 32*e] = dq[e];
+    }
+}

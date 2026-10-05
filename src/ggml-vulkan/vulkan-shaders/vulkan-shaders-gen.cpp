@@ -1032,6 +1032,7 @@ void process_shaders() {
     string_to_spv("step_f32",       "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_step"}});
     string_to_spv("round_f16",      "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_round"}});
     string_to_spv("round_f32",      "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_round"}});
+    string_to_spv("bf16_round_f32", "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_bf16_round"}});  // HOT-Step patch: BF16_ROUND
     string_to_spv("ceil_f16",       "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_ceil"}});
     string_to_spv("ceil_f32",       "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_ceil"}});
     string_to_spv("floor_f16",      "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_floor"}});
@@ -1142,6 +1143,11 @@ void process_shaders() {
     std::map<std::string, std::string> li_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}};
     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", li_dict);
     string_to_spv("lightning_indexer_subgroup_f32", "lightning_indexer.comp", merge_maps(li_dict, {{"USE_SUBGROUP_ADD", "1"}}));
+
+    // HOT-Step patch: flash-attn-train (Vulkan)
+    string_to_spv("fa_train_fwd_f32",     "fa_train_fwd.comp",     {});
+    string_to_spv("fa_train_bwd_dq_f32",  "fa_train_bwd_dq.comp",  {});
+    string_to_spv("fa_train_bwd_dkv_f32", "fa_train_bwd_dkv.comp", {});
 
     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 

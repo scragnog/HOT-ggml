@@ -1,0 +1,69 @@
+#version 450
+
+// HOT-Step patch: flash-attn-train (Vulkan) — GGML_OP_FLASH_ATTN_TRAIN.
+// Online-softmax attention for one query row per cluster; writes O and the
+// row's log-sum-exp. A fully masked row yields O = 0, LSE = 0 (not NaN).
+
+#include "fa_train_common.glsl"
+
+layout(binding = 4) writeonly buffer Db { float d_d[]; };
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint i    = p.row_base + gl_WorkGroupID.x*4 + gl_LocalInvocationID.y;
+    const uint h    = gl_WorkGroupID.y;
+    const uint b    = gl_WorkGroupID.z;
+    const uint E    = p.D/32;
+    const uint hk   = h/(p.Nh/p.Nkv);
+
+    // The alignment gap between O and LSE: zero-width at every real geometry,
+    // but the packed tensor's gradient is scale(packed, 0) and 0 * NaN = NaN.
+    if (i == 0 && h == 0 && b == 0) {
+        const uint n_o = p.D*p.Nh*p.S*p.B;
+        for (uint g = n_o + lane; g < p.lse_off; g += 32) {
+            d_d[p.d_off + g] = 0.0;
+        }
+    }
+    if (i >= p.S) {
+        return;
+    }
+
+    float q[FA_MAXE], acc[FA_MAXE];
+    const uint qb = p.q_off + i*p.q_nb1 + h*p.q_nb2 + b*p.q_nb3;
+    [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+        q[e]   = e < E ? q_d[qb + lane + 32*e] : 0.0;
+        acc[e] = 0.0;
+    }
+    float m = -1.0/0.0, l = 0.0;
+
+    for (uint j = 0; j < p.S_kv; ++j) {
+        const float mv = fa_mask(h, b, i, j);
+        if (fa_is_neg_inf(mv)) {
+            continue;
+        }
+        const uint kb = p.k_off + j*p.k_nb1 + hk*p.k_nb2 + b*p.k_nb3;
+        float dot = 0.0;
+        [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+            if (e < E) dot += q[e]*k_d[kb + lane + 32*e];
+        }
+        const float s     = p.scale*fa_reduce(dot) + mv;
+        const float m_new = max(m, s);
+        const float corr  = exp(m - m_new);
+        const float pj    = exp(s - m_new);
+        l = l*corr + pj;
+        const uint vb = p.v_off + j*p.v_nb1 + hk*p.v_nb2 + b*p.v_nb3;
+        [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+            if (e < E) acc[e] = acc[e]*corr + pj*v_d[vb + lane + 32*e];
+        }
+        m = m_new;
+    }
+
+    const uint ob = p.d_off + p.D*(h + p.Nh*(i + p.S*b));
+    const float inv = l > 0.0 ? 1.0/l : 0.0;
+    [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+        if (e < E) d_d[ob + lane + 32*e] = acc[e]*inv;
+    }
+    if (lane == 0) {
+        d_d[p.d_off + p.lse_off + h + p.Nh*(i + p.S*b)] = l > 0.0 ? m + log(l) : 0.0;
+    }
+}

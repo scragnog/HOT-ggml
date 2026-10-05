@@ -3261,6 +3261,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_UNARY(exp)
     CREATE_UNARY(expm1)
 #undef CREATE_UNARY
+    // HOT-Step patch: BF16_ROUND (F32 only); its pipeline field lives in ggml-vulkan-types.h
+    ggml_vk_create_pipeline(device, device->pipeline_bf16_round, "bf16_round_f32", bf16_round_f32_len, bf16_round_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
 // spec constants: {norepeat, op_on_b}
 #define CREATE_UNARY_MUL(name, idx) \
@@ -3467,6 +3469,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
+
+    // HOT-Step patch: flash-attn-train (Vulkan). The kernels reduce inside
+    // 32-lane clusters with subgroupShuffleXor, so they need both.
+    if (device->subgroup_shuffle && device->subgroup_size >= 32) {
+        ggml_vk_create_pipeline(device, device->pipeline_fa_train_fwd, "fa_train_fwd_f32", fa_train_fwd_f32_len, fa_train_fwd_f32_data, "main", 5, sizeof(vk_op_fa_train_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_train_dq, "fa_train_bwd_dq_f32", fa_train_bwd_dq_f32_len, fa_train_bwd_dq_f32_data, "main", 7, sizeof(vk_op_fa_train_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_train_dkv, "fa_train_bwd_dkv_f32", fa_train_bwd_dkv_f32_len, fa_train_bwd_dkv_f32_data, "main", 7, sizeof(vk_op_fa_train_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv7_f32, "rwkv_wkv7_f32", rwkv_wkv7_f32_len, rwkv_wkv7_f32_data, "main", 8, sizeof(vk_op_rwkv_wkv7_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -8656,6 +8666,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_hardswish[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_ABS:
                 return ctx->device->pipeline_abs[dst->type == GGML_TYPE_F16];
+            case GGML_UNARY_OP_BF16_ROUND:
+                return dst->type == GGML_TYPE_F32 ? ctx->device->pipeline_bf16_round : nullptr;
             case GGML_UNARY_OP_SOFTPLUS:
                 return ctx->device->pipeline_softplus[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_STEP:
@@ -9846,6 +9858,76 @@ static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx
         // shouldn't happen
         GGML_ASSERT(false);
     }
+}
+
+// HOT-Step patch: flash-attn-train (Vulkan). FLASH_ATTN_TRAIN is one dispatch;
+// FLASH_ATTN_TRAIN_BACK is two (dQ per query row, dK/dV per key row) that
+// read only the forward tensors and write disjoint regions, so no barrier.
+static void ggml_vk_flash_attn_train(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const bool back = dst->op == GGML_OP_FLASH_ATTN_TRAIN_BACK;
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * m = dst->src[3];
+    const ggml_tensor * f = back ? dst->src[4] : nullptr;
+    const ggml_tensor * g = back ? dst->src[5] : nullptr;
+
+    vk_op_fa_train_push_constants pc{};
+    pc.D = (uint32_t) q->ne[0]; pc.S = (uint32_t) q->ne[1]; pc.Nh = (uint32_t) q->ne[2]; pc.B = (uint32_t) q->ne[3];
+    pc.S_kv = (uint32_t) k->ne[1]; pc.Nkv = (uint32_t) k->ne[2];
+    pc.q_nb1 = (uint32_t) (q->nb[1]/4); pc.q_nb2 = (uint32_t) (q->nb[2]/4); pc.q_nb3 = (uint32_t) (q->nb[3]/4);
+    pc.k_nb1 = (uint32_t) (k->nb[1]/4); pc.k_nb2 = (uint32_t) (k->nb[2]/4); pc.k_nb3 = (uint32_t) (k->nb[3]/4);
+    pc.v_nb1 = (uint32_t) (v->nb[1]/4); pc.v_nb2 = (uint32_t) (v->nb[2]/4); pc.v_nb3 = (uint32_t) (v->nb[3]/4);
+    pc.has_mask = m != nullptr;
+    pc.m_ne0 = m ? (uint32_t) m->ne[0] : 1; pc.m_ne1 = m ? (uint32_t) m->ne[1] : 1;
+    pc.m_ne2 = m ? (uint32_t) m->ne[2] : 1; pc.m_ne3 = m ? (uint32_t) m->ne[3] : 1;
+    memcpy(&pc.scale, (const float *) dst->op_params + 0, sizeof(float));
+    pc.lse_off = (uint32_t) (ggml_flash_attn_train_lse_offset(q)/4);
+    if (back) {
+        size_t oq, ok, ov; int64_t n;
+        ggml_flash_attn_train_back_offsets(q, k, v, &oq, &ok, &ov, &n);
+        pc.dk_off = (uint32_t) (ok/4); pc.dv_off = (uint32_t) (ov/4);
+    }
+    pc.q_off = get_misalign_bytes(ctx, q)/4; pc.k_off = get_misalign_bytes(ctx, k)/4; pc.v_off = get_misalign_bytes(ctx, v)/4;
+    pc.m_off = m ? get_misalign_bytes(ctx, m)/2 : 0;
+    pc.f_off = f ? get_misalign_bytes(ctx, f)/4 : 0; pc.g_off = g ? get_misalign_bytes(ctx, g)/4 : 0;
+    pc.d_off = get_misalign_bytes(ctx, dst)/4;
+
+    const vk_subbuffer qb = ggml_vk_tensor_subbuffer(ctx, q, true);
+    const vk_subbuffer kb = ggml_vk_tensor_subbuffer(ctx, k, true);
+    const vk_subbuffer vb = ggml_vk_tensor_subbuffer(ctx, v, true);
+    const vk_subbuffer mb = m ? ggml_vk_tensor_subbuffer(ctx, m, true) : qb;  // unread without a mask
+    const vk_subbuffer db = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    // Each row loops over every row of the other side, so one dispatch over a
+    // whole song is seconds of GPU time: the desktop freezes on a GPU that
+    // also drives the display, and Windows resets the device past its TDR
+    // limit. Slice the rows so a dispatch stays around 2^25 (row, partner,
+    // head) pairs, a few tens of ms; the display can preempt between slices.
+    const auto sliced = [&](vk_pipeline & pipeline, std::initializer_list<vk::DescriptorBufferInfo> bufs,
+                            uint32_t rows, uint32_t partners, uint32_t heads) {
+        // GGML_VK_FA_TRAIN_SLICE_PAIRS overrides the budget (tests force tiny slices).
+        static const uint64_t budget = getenv("GGML_VK_FA_TRAIN_SLICE_PAIRS") ?
+            std::max<uint64_t>(1, strtoull(getenv("GGML_VK_FA_TRAIN_SLICE_PAIRS"), nullptr, 10)) : (1ull << 25);
+        const uint64_t per_row = std::max<uint64_t>(1, (uint64_t) partners * heads * pc.B);
+        uint32_t slice = (uint32_t) std::max<uint64_t>(4, (budget / per_row) & ~3ull);
+        slice = std::min(slice, (rows + 3) & ~3u);
+        const uint32_t n = (rows + slice - 1)/slice;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, n);
+        for (uint32_t r = 0; r < rows; r += slice) {
+            pc.row_base = r;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, bufs, pc, {(std::min(slice, rows - r) + 3)/4, heads, pc.B});
+        }
+    };
+    if (!back) {
+        sliced(ctx->device->pipeline_fa_train_fwd, {qb, kb, vb, mb, db}, pc.S, pc.S_kv, pc.Nh);
+        return;
+    }
+    const vk_subbuffer fb = ggml_vk_tensor_subbuffer(ctx, f, true);
+    const vk_subbuffer gb = ggml_vk_tensor_subbuffer(ctx, g, true);
+    // dK/dV rows loop over every query row of every head in their group.
+    sliced(ctx->device->pipeline_fa_train_dq, {qb, kb, vb, mb, fb, gb, db}, pc.S, pc.S_kv, pc.Nh);
+    sliced(ctx->device->pipeline_fa_train_dkv, {qb, kb, vb, mb, fb, gb, db}, pc.S_kv, pc.S*(pc.Nh/pc.Nkv), pc.Nkv);
 }
 
 void ggml_vk_rwkv_wkv6(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -12267,6 +12349,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         case GGML_UNARY_OP_FLOOR:
         case GGML_UNARY_OP_TRUNC:
         case GGML_UNARY_OP_SGN:
+        case GGML_UNARY_OP_BF16_ROUND:
             ggml_vk_unary(ctx, compute_ctx, src0, node);
             break;
         case GGML_UNARY_OP_XIELU:
@@ -12434,6 +12517,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_FLASH_ATTN_TRAIN:
+    case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+        ggml_vk_flash_attn_train(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -15101,6 +15189,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                            (op->src[0]->type == op->type);
+                case GGML_UNARY_OP_BF16_ROUND:
+                    return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
                 default:
                     return false;
             }
@@ -15570,6 +15660,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
+        case GGML_OP_FLASH_ATTN_TRAIN:       // HOT-Step patch: flash-attn-train (Vulkan)
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            {
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * mk = op->src[3];
+                float prm[3];
+                memcpy(prm, op->op_params, sizeof(prm));
+                return device->pipeline_fa_train_fwd != nullptr &&
+                       q->ne[0] % 32 == 0 && q->ne[0] <= 256 && prm[1] == 0.0f && prm[2] == 0.0f &&
+                       q->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                       q->nb[0] == 4 && op->src[1]->nb[0] == 4 && op->src[2]->nb[0] == 4 &&
+                       (!mk || (mk->type == GGML_TYPE_F16 && ggml_is_contiguous(mk)));
+            }
         case GGML_OP_GATED_LINEAR_ATTN:
             // the shader block size is hardcoded to head_size 64
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;

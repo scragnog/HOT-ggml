@@ -644,6 +644,20 @@ struct vk_op_pool2d_push_constants {
     int32_t p0; int32_t p1;
 };
 
+// HOT-Step patch: flash-attn-train (Vulkan) — mirrors fa_train_common.glsl
+struct vk_op_fa_train_push_constants {
+    uint32_t D, S, Nh, B, S_kv, Nkv;
+    uint32_t q_nb1, q_nb2, q_nb3;
+    uint32_t k_nb1, k_nb2, k_nb3;
+    uint32_t v_nb1, v_nb2, v_nb3;
+    uint32_t m_ne0, m_ne1, m_ne2, m_ne3, has_mask;
+    float    scale;
+    uint32_t lse_off, dk_off, dv_off;
+    uint32_t q_off, k_off, v_off, m_off, f_off, g_off, d_off;
+    uint32_t row_base;
+};
+static_assert(sizeof(vk_op_fa_train_push_constants) <= 128, "fa_train push constants exceed 128 bytes");
+
 struct vk_op_rwkv_wkv6_push_constants {
     uint32_t B;
     uint32_t T;

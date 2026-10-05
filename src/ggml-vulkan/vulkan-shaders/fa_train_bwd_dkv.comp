@@ -1,0 +1,77 @@
+#version 450
+
+// HOT-Step patch: flash-attn-train (Vulkan) — GGML_OP_FLASH_ATTN_TRAIN_BACK, pass B.
+// dK, dV for one key row per cluster, summed over the query heads that share
+// its KV head, in the CPU oracle's order (heads ascending, then rows):
+//   dV_j = sum_i P_ij dO_i,  dK_j = scale * sum_i dS_ij Q_i
+// Writes only regions pass A never touches, so the two need no barrier.
+
+#include "fa_train_common.glsl"
+
+layout(binding = 4) readonly buffer Fb { float f_d[]; };
+layout(binding = 5) readonly buffer Gb { float g_d[]; };
+layout(binding = 6) writeonly buffer Db { float d_d[]; };
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint j    = p.row_base + gl_WorkGroupID.x*4 + gl_LocalInvocationID.y;
+    const uint hk   = gl_WorkGroupID.y;
+    const uint b    = gl_WorkGroupID.z;
+    const uint E    = p.D/32;
+    const uint G    = p.Nh/p.Nkv;
+    if (j >= p.S_kv) {
+        return;
+    }
+
+    float k[FA_MAXE], v[FA_MAXE], dk[FA_MAXE], dv[FA_MAXE];
+    const uint kb = p.k_off + j*p.k_nb1 + hk*p.k_nb2 + b*p.k_nb3;
+    const uint vb = p.v_off + j*p.v_nb1 + hk*p.v_nb2 + b*p.v_nb3;
+    [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+        k[e]  = e < E ? k_d[kb + lane + 32*e] : 0.0;
+        v[e]  = e < E ? v_d[vb + lane + 32*e] : 0.0;
+        dk[e] = 0.0;
+        dv[e] = 0.0;
+    }
+
+    for (uint g = 0; g < G; ++g) {
+        const uint h = hk*G + g;
+        for (uint i = 0; i < p.S; ++i) {
+            const float mv = fa_mask(h, b, i, j);
+            if (fa_is_neg_inf(mv)) {
+                continue;
+            }
+            const uint qb = p.q_off + i*p.q_nb1 + h*p.q_nb2 + b*p.q_nb3;
+            float dot = 0.0;
+            [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+                if (e < E) dot += q_d[qb + lane + 32*e]*k[e];
+            }
+            const float lse = f_d[p.f_off + p.lse_off + h + p.Nh*(i + p.S*b)];
+            const float pij = exp(p.scale*fa_reduce(dot) + mv - lse);
+            if (pij == 0.0) {
+                continue;
+            }
+            const uint ob = p.D*(h + p.Nh*(i + p.S*b));
+            float dp = 0.0, di = 0.0;
+            [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+                if (e < E) {
+                    const float go = g_d[p.g_off + ob + lane + 32*e];
+                    dp += go*v[e];
+                    di += go*f_d[p.f_off + ob + lane + 32*e];
+                    dv[e] += pij*go;
+                }
+            }
+            const float c = p.scale*pij*(fa_reduce(dp) - fa_reduce(di));
+            [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+                if (e < E) dk[e] += c*q_d[qb + lane + 32*e];
+            }
+        }
+    }
+
+    const uint ob2 = p.d_off + p.D*(j + p.S_kv*(hk + p.Nkv*b));
+    [[unroll]] for (uint e = 0; e < FA_MAXE; ++e) {
+        if (e < E) {
+            d_d[ob2 + p.dk_off + lane + 32*e] = dk[e];
+            d_d[ob2 + p.dv_off + lane + 32*e] = dv[e];
+        }
+    }
+}

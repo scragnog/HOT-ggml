@@ -889,6 +889,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_hardsigmoid[2];
     vk_pipeline pipeline_hardswish[2];
     vk_pipeline pipeline_abs[2];
+    vk_pipeline pipeline_bf16_round;  // HOT-Step patch: BF16_ROUND (F32 only)
     vk_pipeline pipeline_softplus[2];
     vk_pipeline pipeline_step[2];
     vk_pipeline pipeline_round[2];
@@ -967,6 +968,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_pool1d_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_rwkv_wkv6_f32;
+    // HOT-Step patch: flash-attn-train (Vulkan); null without 32-lane subgroup shuffles
+    vk_pipeline pipeline_fa_train_fwd, pipeline_fa_train_dq, pipeline_fa_train_dkv;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];

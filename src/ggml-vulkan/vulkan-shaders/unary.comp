@@ -170,6 +170,17 @@ float op_trunc(float x) {
     return trunc(x);
 }
 
+// HOT-Step patch: BF16_ROUND — round to the nearest BF16 value, ties to even,
+// NaN kept quiet; bit-identical to the CPU's GGML_FP32_TO_BF16.
+float op_bf16_round(float x) {
+    uint u = floatBitsToUint(x);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return uintBitsToFloat((u | 0x00400000u) & 0xffff0000u);
+    }
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return uintBitsToFloat(u & 0xffff0000u);
+}
+
 void main() {
     uint idx = get_idx();
 
