@@ -2126,6 +2126,9 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        // HOT-Step: Metal reserves scratch behind dst for these (see ggml_backend_metal_buffer_type_get_alloc_size)
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+        case GGML_OP_CONVROT8:
             return true;
         default:
             return false;

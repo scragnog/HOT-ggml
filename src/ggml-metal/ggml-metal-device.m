@@ -129,7 +129,8 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
-    X(MISC,            misc)
+    X(MISC,            misc)           \
+    X(HOTSTEP_TRAIN,   hotstep_train)
 
 enum ggml_metal_lib_kind {
 #define X(e, s) GGML_METAL_LIB_##e,
@@ -1021,8 +1022,31 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
+    // HOT-Step: this was a hard GGML_ASSERT (see the note below), which
+    // aborted the whole process during exit()'s static destructors whenever
+    // a caller's ggml_backend_buffer_t outlives ggml_backend_free() -- e.g.
+    // ace-train's model/weight-context buffers, which the trainers never
+    // explicitly free before returning from main() because the process is
+    // about to exit anyway and doing so would just spend time returning
+    // multi-GB allocations to an OS that is about to reclaim them regardless.
+    // Confirmed harmless in that case (Axel, M1 Max, 2026-09-24): a
+    // yue2-joint-train run completed all steps, exported its LoRA adapter,
+    // printed "done:", and only then hit this exact assert on the way out --
+    // a crash after the work was already saved to disk, not during it. A
+    // leftover residency set at process-exit time is not itself a bug in the
+    // training run; downgrading to a warning keeps the diagnostic (still
+    // useful for catching a REAL leak during normal, non-exit teardown, e.g.
+    // reused backends in long-lived processes) without taking the process
+    // down over work it already finished.
+    // note: if you see this warning outside of process exit, most likely you
+    // haven't deallocated all Metal resources before freeing the device.
+    if ([rsets->data count] != 0) {
+        GGML_LOG_WARN("%s: %d residency set(s) still registered at teardown -- "
+                       "a Metal backend consumer (e.g. a model/weight-context "
+                       "buffer) was not freed before the device was freed. "
+                       "Harmless if this happens during process exit.\n",
+                       __func__, (int) [rsets->data count]);
+    }
 
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
 
@@ -1574,6 +1598,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 case GGML_UNARY_OP_TRUNC:
                 case GGML_UNARY_OP_XIELU:
                     return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+                case GGML_UNARY_OP_BF16_ROUND:
+                    // HOT-Step: BF16_ROUND's CPU/CUDA kernels are F32-only by
+                    // construction (ggml_bf16_round() in ggml.c asserts
+                    // a->type == GGML_TYPE_F32), so this mirrors that
+                    // instead of the looser F32-or-F16 rule shared above.
+                    return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
                 default:
                     return false;
             }
@@ -1642,6 +1672,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
+        case GGML_OP_REPEAT_BACK:
+            // HOT-Step: mirrors ggml-cpu/ops.cpp's own constraints exactly
+            // (ggml_compute_forward_repeat_back_f32: F32 only, dim-0 must be
+            // a real contiguous float, dst shape must divide src0's --
+            // ggml_can_repeat(dst, src0) is the same check ggml_repeat_back's
+            // own constructor already asserts in ggml.c, so it always holds
+            // here, but is spelled out again for supports_op's own clarity).
+            // docs/plans/yue2-joint-training-metal-port.md, Phase 3 kernel #3.
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                op->nb[0] == ggml_type_size(op->type) &&
+                ggml_can_repeat(op, op->src[0]);
         case GGML_OP_CONV_TRANSPOSE_2D:
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                 (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
@@ -1678,9 +1721,112 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+        case GGML_OP_RMS_NORM_BACK:
+            // HOT-Step: RMS_NORM_BACK. F32-only (matches ggml-cpu/ops.cpp's
+            // ggml_compute_forward_rms_norm_back, which only implements an
+            // F32 case), both inputs required same-shape and contiguous
+            // within a row -- ggml_metal_kargs_rms_norm_back has no nb00/
+            // nb10 fields to fall back on for a non-unit row stride.
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(op->src[0], op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_CONVROT8:
+            // HOT-Step: CONVROT8. Mirrors ggml-cpu's own minimal supports_op
+            // (ggml_convrot8()'s constructor in ggml.c already asserts the
+            // full type/shape contract: weight_i8[in,out] I8, activation/
+            // scales/bias F32, bias optional) -- this Metal kernel further
+            // assumes everything is fully contiguous, since
+            // ggml_metal_kargs_convrot8 carries no stride fields at all.
+            // Needs simdgroup reduction for the row's amax (simd_max).
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_I8  &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                (!op->src[3] || op->src[3]->type == GGML_TYPE_F32) &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                (!op->src[3] || ggml_is_contiguous(op->src[3])) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_CONVROT8_BACK:
+            // HOT-Step: CONVROT8_BACK. Only weight/dy/scales are read (the
+            // activation gradient is the only differentiable input -- see
+            // ggml_convrot8_back()'s src wiring in ggml.c). No simdgroup
+            // reduction is used by this kernel (unlike the forward pass).
+            return op->src[0]->type == GGML_TYPE_I8  &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_OUT_PROD:
+            // HOT-Step: OUT_PROD (kernel #6). F32-only -- this project's
+            // usage (the AR block's LoRA/adapter matmul gradients) is always
+            // F32xF32->F32 (see ggml_metal_kargs_out_prod's own comment in
+            // ggml-metal-impl.h); the CPU reference's quantized/F16 src0
+            // variants are out of scope, so a non-F32 src0 correctly falls
+            // through to another backend instead of silently mis-computing.
+            // ggml_out_prod()'s own constructor in ggml.c already asserts
+            // !ggml_is_transposed(src0) and the ne[1]/broadcast contract, so
+            // no further shape check is needed here (same minimal-check
+            // philosophy as CONVROT8's supports_op above) -- only the
+            // per-kernel assumption that src0's row (dim0) is addressable
+            // via a stride (nb00), which every ggml tensor satisfies.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32;
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;
+        case GGML_OP_FLASH_ATTN_TRAIN:
+            // HOT-Step: FLASH_ATTN_TRAIN (kernel #7). F32 scalar port only --
+            // see ggml_metal_kargs_flash_attn_train's own comment in
+            // ggml-metal-impl.h. v is NOT transposed (D==DV, the op's own
+            // "v1 restriction" in ggml.h), matching this kernel's read
+            // pattern; mask, when present, is already asserted F16-
+            // contiguous by ggml_flash_attn_train()'s own constructor in
+            // ggml.c, so no further check is needed here.
+            //
+            // op_params slots 1/2 (max_bias, logit_softcap) are reserved and
+            // must be exactly 0.0f -- the CPU reference asserts this and the
+            // CUDA port falls back rather than silently ignore a nonzero
+            // value (fattn-train.cu's own supports check). This kernel never
+            // reads those slots, so a caller that ever sets them must fall
+            // through to a backend that actually honours them.
+            //
+            // 2026-09-22 register-accumulator redesign: the kernel is now a
+            // compile-time template instantiated only for D in {64, 128}
+            // (this project's own head_dim is 128, yue2-aitk-graph.h; 64
+            // mirrors the CUDA port's own scope, fattn-train.cu's dispatch
+            // switch) -- any other head dim falls through to CPU/CUDA here,
+            // same as an unsupported type would.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                (op->src[0]->ne[0] == 64 || op->src[0]->ne[0] == 128) &&
+                ((const float *) op->op_params)[1] == 0.0f &&
+                ((const float *) op->op_params)[2] == 0.0f;
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            // HOT-Step: FLASH_ATTN_TRAIN_BACK (kernel #7). Same F32-only
+            // scope; the forward/dfwd packed tensors are always F32
+            // (ggml_flash_attn_train_back()'s own asserts in ggml.c). Same
+            // reserved-params requirement and D in {64, 128} gate as the
+            // forward, above.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                (op->src[0]->ne[0] == 64 || op->src[0]->ne[0] == 128) &&
+                ((const float *) op->op_params)[1] == 0.0f &&
+                ((const float *) op->op_params)[2] == 0.0f;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_CONV_2D:

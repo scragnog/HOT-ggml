@@ -193,6 +193,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
+    ggml_metal_op_convrot8_check_report();
+
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
