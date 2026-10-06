@@ -422,7 +422,13 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_CONVROT8 || op->op == GGML_OP_CONVROT8_BACK) return false;
+    // HOT-Step patch: yue2-convrot8-cpu
+    // Was: `return false;` (ConvRot8 used to be CUDA-only). ggml_convrot8()'s
+    // own asserts in ggml.c already enforce the exact type/shape contract
+    // (I8 weight, F32 activation/scales/bias) this CPU kernel relies on, so
+    // no further shape check is needed here -- see
+    // ggml_compute_forward_convrot8{,_back} in ops.cpp.
+    if (op->op == GGML_OP_CONVROT8 || op->op == GGML_OP_CONVROT8_BACK) return true;
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 

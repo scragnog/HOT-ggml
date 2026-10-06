@@ -105,6 +105,9 @@ void ggml_compute_forward_flash_attn_back(
 // HOT-Step patch: flash-attn-train
 void ggml_compute_forward_flash_attn_train(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_train_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// HOT-Step patch: yue2-convrot8-cpu
+void ggml_compute_forward_convrot8(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_convrot8_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ssm_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ssm_scan(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_win_part(const struct ggml_compute_params * params, struct ggml_tensor * dst);
