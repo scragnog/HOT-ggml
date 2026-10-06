@@ -37,6 +37,30 @@ typedef matrix<bfloat, 4, 4> bfloat4x4;
 typedef matrix<bfloat, 2, 4> bfloat2x4;
 #endif
 
+// HOT-Step: BF16_ROUND fp32->bf16->fp32 round-trip cast, IEEE-754 round-to-nearest-even -- the same rounding
+// GGML_FP32_TO_BF16 (CPU) and __float2bfloat16 (CUDA) implement. Without native bfloat the same rounding is
+// done on the bit pattern.
+// generic fallback (half/half4 instantiations of the bin kernel; FC_bin_rnd is never set for them)
+template<typename TC> inline TC bf16_round_cast(TC x) { return x; }
+
+#if defined(GGML_METAL_HAS_BF16)
+template<> inline float  bf16_round_cast<float> (float  x) { return (float)  (bfloat)  x; }
+template<> inline float4 bf16_round_cast<float4>(float4 x) { return (float4) (bfloat4) x; }
+#else
+inline float bf16_round_bits(float x) {
+    uint u = as_type<uint>(x);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return x; // NaN
+    }
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return as_type<float>(u & 0xffff0000u);
+}
+template<> inline float  bf16_round_cast<float> (float  x) { return bf16_round_bits(x); }
+template<> inline float4 bf16_round_cast<float4>(float4 x) {
+    return float4(bf16_round_bits(x[0]), bf16_round_bits(x[1]), bf16_round_bits(x[2]), bf16_round_bits(x[3]));
+}
+#endif
+
 constexpr constant static float kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f, 1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
 };

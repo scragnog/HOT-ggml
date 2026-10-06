@@ -176,6 +176,10 @@ kernel void kernel_unary_impl(
             const TC y_neg   = (exp(clamped) - TC(1.0f) - xi) * TC(args.slope) + TC(args.bias) * xi;
             dst_ptr[i0] = (T) (gate * y_pos + (TC(1.0f) - gate) * y_neg);
         }
+
+        if (FC_OP == OP_UNARY_NUM_BF16_ROUND) {
+            dst_ptr[i0] = (T) bf16_round_cast(x);
+        }
     }
 
 #undef FC_OP
