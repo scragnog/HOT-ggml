@@ -242,6 +242,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 // scratch region -- see ggml_metal_op_flash_attn_train_back_extra_delta's
                 // own comment in ggml-metal-ops.h.
                 res += ggml_metal_op_flash_attn_train_back_extra_delta(tensor);
+                res += ggml_metal_op_flash_attn_train_back_extra_dsw(tensor);   // dS scratch (opt-out GGML_METAL_FA_TRAIN_DSW=0)
             } break;
         case GGML_OP_CONVROT8:
             {

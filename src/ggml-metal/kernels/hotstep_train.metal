@@ -2917,6 +2917,9 @@ kernel void kernel_flash_attn_train_back_dq_mm_f32(
         const int64_t i_last = min((int64_t) args.S - 1, blk*(NSG*8) + NSG*8 - 1);
         j_end = min((int64_t) args.S_kv, (int64_t) args.causal_prefix + i_last + 1);
     }
+    if (args.jlim > 0) {   // NAR hybrid prefix pass: keys [0, jlim) only; the DSW reader continues from the stored accumulator
+        j_end = min(j_end, (int64_t) args.jlim);
+    }
     const int64_t h  = tgpig.y;
     const int64_t b  = tgpig.z;
     const int64_t hk = h/args.G;
@@ -3397,10 +3400,18 @@ template [[host_name("kernel_flash_attn_train_back_dkdv_f32_d128")]] kernel kern
 //   dP^T = V dO^T, dS^T = scale*P^T*(dP^T - delta_i), dK += dS^T Q   (DK only; mv fragments)
 // Same masked-tile skip, kv_grad_start early-out and accumulation order
 // (g ascending, query tiles ascending) as the scalar kernel.
+// no fused multiply-add: round(scale*S) first, then + mask, then - LSE
+static inline float ds_nofma_t(float scale, float sraw, float mvv, float lse) {
+    #pragma clang fp contract(off)
+    const float a = scale*sraw;
+    const float b = a + mvv;
+    return b - lse;
+}
+
 #define HOT_STEP_FA_TRAIN_BKV_NSG 8    // keep in sync with ggml-metal-ops.cpp
 #define HOT_STEP_FA_TRAIN_BKV_NQ  8    // keep in sync with ggml-metal-ops.cpp
 
-template <int D, bool DK, bool CAUSAL, int NSG_ = 8>
+template <int D, bool DK, bool CAUSAL, int NSG_ = 8, bool DSW = false>
 kernel void kernel_flash_attn_train_back_kv_mm_f32(
         constant ggml_metal_kargs_flash_attn_train_back & args,
         device const char * q,
@@ -3411,6 +3422,7 @@ kernel void kernel_flash_attn_train_back_kv_mm_f32(
         device const char * dfwd,
         device const char * delta,
         device       char * dst,
+        device       float * dsbuf [[buffer(9)]],   // DSW only: dS tile scratch (see kernel_flash_attn_train_back_dq_ds_f32)
         threadgroup char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -3442,7 +3454,7 @@ kernel void kernel_flash_attn_train_back_kv_mm_f32(
 
     const int64_t j0b = tgpig.x*(NSG*8);       // first kv row of the threadgroup
     const int64_t j0  = j0b + w*8;             // first kv row of this simdgroup
-    const int64_t hk  = tgpig.y;
+    const int64_t hk  = tgpig.y + (DSW ? (int64_t) args.hk0 : 0);
     const int64_t b   = tgpig.z;
 
     // detached-prefix tile: write zeros and leave (threadgroup-uniform, before any barrier)
@@ -3465,6 +3477,15 @@ kernel void kernel_flash_attn_train_back_kv_mm_f32(
     const short   CPL   = NQ/4;           // query columns per lane (4 lanes per row)
     const short   cq    = (lane & 3)*CPL;
     const int64_t j_row = j0 + r;               // this lane's kv row
+
+    // DSW (dS materialization, causal + kv_grad_start == 0 only): this simdgroup writes dS for its
+    // 8 keys x every visited 8-query tile as a row-major [query][key] 8x8 tile (the layout the dQ
+    // reader loads with one simdgroup_load). Tile (hl, b, it, jt) at ((((hl*Bn + b)*nIt + it)*nJt + jt)*64.
+    // Tiles that are fully masked are never written and never read (the reader skips them with the same
+    // geometric rule).
+    const int64_t ds_nIt = (S + 7)/8;
+    const int64_t ds_nJt = (S_kv - (int64_t) args.jstart + 7)/8;
+    const bool    ds_ok  = DSW && (j0 < S_kv);
 
     // ---- stage K (and V for DK) into register fragments through the Q/dO tile buffer ----
     simdgroup_float8x8 mk[NV];
@@ -3635,6 +3656,7 @@ kernel void kernel_flash_attn_train_back_kv_mm_f32(
             for (short c = 0; c < CPL; ++c) {
                 const int64_t i = i0 + cq + c;
                 float outv = 0.0f;
+                float outw = 0.0f;   // DSW: the value written to the scratch (== outv unless ds_var != 0)
                 if (j_row < S_kv && i < S) {
                     const float mvv = flash_attn_train_mask_val_t<CAUSAL>(args.causal_prefix, mp, args.has_mask, args.mne0, args.mne1, args.mne2, args.mne3, h, b, i, j_row);
                     if (mvv != -INFINITY) {
@@ -3647,9 +3669,27 @@ kernel void kernel_flash_attn_train_back_kv_mm_f32(
                         } else {
                             outv = p;
                         }
+                        if (DSW) {
+                            outw = outv;
+                            if (args.ds_var != 0) {
+                                // experiment: reproduce the dQ kernel's rounding of dS (the two kernels contract scale*S - LSE differently)
+                                const float sraw = ssh_w[r*NQP + cq + c];
+                                float t;
+                                if (args.ds_var == 1) {
+                                    t = fma(args.scale, sraw, mvv - lse_sh[cq + c]);
+                                } else {
+                                    t = ds_nofma_t(args.scale, sraw, mvv, lse_sh[cq + c]);
+                                }
+                                const float p2 = exp(t);
+                                outw = p2 != 0.0f ? args.scale*(p2*(psh_w[r*NQP + cq + c] - del_sh[cq + c])) : 0.0f;
+                            }
+                        }
                     }
                 }
                 ssh_w[r*NQP + cq + c] = outv;
+                if (DSW && ds_ok) {
+                    dsbuf[((((h - (int64_t) args.ds_h0)*(int64_t) args.Bn + b)*ds_nIt + (i0 >> 3))*ds_nJt + ((j0 - (int64_t) args.jstart) >> 3))*64 + (cq + c)*8 + r] = outw;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3724,6 +3764,160 @@ template [[host_name("kernel_flash_attn_train_back_dv_mm_n12_f32_d128")]] kernel
 template [[host_name("kernel_flash_attn_train_back_dv_mm_n12_causal_f32_d128")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<128, false, true, 12>;
 template [[host_name("kernel_flash_attn_train_back_dk_mm_n12_f32_d128")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<128, true, false, 12>;
 template [[host_name("kernel_flash_attn_train_back_dk_mm_n12_causal_f32_d128")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<128, true, true, 12>;
+template [[host_name("kernel_flash_attn_train_back_dk_dsw_mm_n6_causal_f32_d64")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<64, true, true, 6, true>;
+template [[host_name("kernel_flash_attn_train_back_dk_dsw_mm_n6_causal_f32_d128")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<128, true, true, 6, true>;
+template [[host_name("kernel_flash_attn_train_back_dk_dsw_mm_n6_f32_d64")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<64, true, false, 6, true>;
+template [[host_name("kernel_flash_attn_train_back_dk_dsw_mm_n6_f32_d128")]] kernel kernel_flash_attn_train_back_kv_mm_f32_t kernel_flash_attn_train_back_kv_mm_f32<128, true, false, 6, true>;
+
+// dS-materialization dQ reader (opt-in GGML_METAL_FA_TRAIN_DSW=1, causal, kv_grad_start == 0).
+// Same dQ contract and accumulation order as kernel_flash_attn_train_back_dq_mm_f32
+// (dQ += dS K over ascending 8-key tiles, 8x8 f32 MMA, acc starting at +0), but dS comes from the
+// scratch written by the DSW dK kernel instead of being recomputed (no S, no dP, no exp, no Q/dO
+// fragments). Fully masked tiles contribute exact zeros in the old kernel and are skipped here.
+// Grid (ceil(S/(NSG*8)) reversed, ds_nh, Bn); head h = ds_h0 + tgpig.y.
+template <int D, int NSG_, int NC_>
+kernel void kernel_flash_attn_train_back_dq_ds_f32(
+        constant ggml_metal_kargs_flash_attn_train_back & args,
+        device const char * k,
+        device       char * dst,
+        device const float * dsbuf,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = NSG_;
+    constexpr short NC  = NC_;
+    constexpr short NCB = NC/8;
+    constexpr short NV  = D/8;
+    constexpr short LD  = D + 1;
+    constexpr short D4  = D/4;
+
+    // smem: [Ksh NC*LD][out NSG*64]
+    threadgroup float * Ksh = (threadgroup float *) shmem;
+    threadgroup float * Osh = Ksh + NC*LD;
+
+    const short  lane = tiisg;
+    const short  w    = sgitg;
+    const ushort tid  = w*N_SIMDWIDTH + lane;
+
+    const int64_t Nh = args.Nh;
+    const int64_t S  = args.S;
+
+    const int64_t nblk = (args.S + NSG*8 - 1)/(NSG*8);
+    const bool    causal = args.causal_prefix >= 0;
+    const int64_t jstart = args.jstart;
+    const int64_t blk  = causal ? nblk - 1 - (int64_t) tgpig.x : (int64_t) tgpig.x;
+    const int64_t i0   = blk*(NSG*8) + w*8;
+    const int64_t i_last = min((int64_t) args.S - 1, blk*(NSG*8) + NSG*8 - 1);
+    const int64_t j_end  = causal ? min((int64_t) args.S_kv, (int64_t) args.causal_prefix + i_last + 1) : (int64_t) args.S_kv;
+    const int64_t h  = (int64_t) args.ds_h0 + tgpig.y;
+    const int64_t b  = tgpig.z;
+    const int64_t hk = h/args.G;
+
+    const int64_t ds_nIt = (S + 7)/8;
+    const int64_t ds_nJt = ((int64_t) args.S_kv - jstart + 7)/8;
+    const bool    i_ok   = i0 < S;
+    device const float * ds_row = dsbuf + ((((h - (int64_t) args.ds_h0)*(int64_t) args.Bn + b)*ds_nIt + (i0 >> 3))*ds_nJt)*64;
+    // last key visible to any row of this simdgroup's 8-row tile
+    const int64_t j_vis = causal ? (int64_t) args.causal_prefix + i0 + 7 : (int64_t) 0x7fffffffffffffffLL;
+
+    simdgroup_float8x8 acc[NV];
+    #pragma clang loop unroll(full)
+    for (short c = 0; c < NV; ++c) {
+        acc[c] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    if (jstart > 0) {
+        // continue the accumulation chain of the prefix pass (old dQ kernel over keys [0, jstart)), stored as dQ
+        threadgroup float * osh_i = Osh + w*64;
+        const short ri = lane >> 2;
+        const short ci = (lane & 3)*2;
+        #pragma clang loop unroll(full)
+        for (short c = 0; c < NV; ++c) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int64_t i_r = i0 + ri;
+            float2 v = float2(0.0f);
+            if (i_r < S) {
+                device const float * dqi = (device const float *) (dst + args.offs_dq + (i_r + S*(h + Nh*b))*D*sizeof(float));
+                v = float2(dqi[c*8 + ci], dqi[c*8 + ci + 1]);
+            }
+            osh_i[ri*8 + ci    ] = v.x;
+            osh_i[ri*8 + ci + 1] = v.y;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(acc[c], osh_i, 8);
+        }
+    }
+
+    for (int64_t j0 = jstart; j0 < j_end; j0 += NC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int64_t nk = (args.S_kv - j0 < NC) ? (args.S_kv - j0) : (int64_t) NC;
+        for (short idx = tid; idx < NC*D4; idx += NSG*N_SIMDWIDTH) {
+            const short jj  = idx/D4;
+            const short dd4 = idx%D4;
+            float4 kval = float4(0.0f);
+            if (jj < nk) {
+                device const float4 * krow = (device const float4 *) (k + (j0 + jj)*args.nb11 + hk*args.nb12 + b*args.nb13);
+                kval = krow[dd4];
+            }
+            *(threadgroup packed_float4 *) (Ksh + jj*LD + dd4*4) = packed_float4(kval);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (i_ok) {
+            #pragma clang loop unroll(full)
+            for (short cb = 0; cb < NCB; ++cb) {
+                const int64_t jt0 = j0 + cb*8;
+                if (jt0 < args.S_kv && jt0 <= j_vis) {
+                    simdgroup_float8x8 dsm;
+                    simdgroup_load(dsm, ds_row + ((jt0 - jstart) >> 3)*64, 8);
+                    #pragma clang loop unroll(full)
+                    for (short c = 0; c < NV; ++c) {
+                        simdgroup_float8x8 mk8;
+                        simdgroup_load(mk8, Ksh + cb*8*LD + c*8, LD);
+                        simdgroup_multiply_accumulate(acc[c], dsm, mk8, acc[c]);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- write dQ ----
+    {
+        threadgroup float * osh_w = Osh + w*64;
+        const short r  = lane >> 2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short c = 0; c < NV; ++c) {
+            simdgroup_store(acc[c], osh_w, 8);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int64_t i_row = i0 + r;
+            if (i_row < S) {
+                const int64_t  dq_row = i_row + S*(h + Nh*b);
+                device float * dqi    = (device float *) (dst + args.offs_dq + dq_row*D*sizeof(float));
+                const short    cc     = (lane & 3)*2;
+                dqi[c*8 + cc    ] = osh_w[r*8 + cc    ];
+                dqi[c*8 + cc + 1] = osh_w[r*8 + cc + 1];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_train_back_dq_ds_f32<128, 8, 16>) kernel_flash_attn_train_back_dq_ds_f32_t;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n4_c8_causal_f32_d64")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<64, 4, 8>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n4_c16_causal_f32_d64")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<64, 4, 16>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n4_c32_causal_f32_d64")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<64, 4, 32>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n8_c8_causal_f32_d64")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<64, 8, 8>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n8_c16_causal_f32_d64")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<64, 8, 16>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n8_c32_causal_f32_d64")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<64, 8, 32>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n4_c8_causal_f32_d128")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<128, 4, 8>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n4_c16_causal_f32_d128")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<128, 4, 16>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n4_c32_causal_f32_d128")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<128, 4, 32>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n8_c8_causal_f32_d128")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<128, 8, 8>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n8_c16_causal_f32_d128")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<128, 8, 16>;
+template [[host_name("kernel_flash_attn_train_back_dq_ds_n8_c32_causal_f32_d128")]] kernel kernel_flash_attn_train_back_dq_ds_f32_t kernel_flash_attn_train_back_dq_ds_f32<128, 8, 32>;
 
 // HOT-Step: vectorised f32 -> f32 copy for same-shape tensors with 16-byte-aligned contiguous rows
 // (CPY/CONT of views, and the src0 -> dst copy of non-inplace ACC/SET). One float4 per thread.

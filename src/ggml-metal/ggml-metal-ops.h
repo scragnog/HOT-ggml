@@ -95,6 +95,7 @@ int ggml_metal_op_flash_attn_train_back (ggml_metal_op_t ctx, int idx);
 // ggml_backend_metal_buffer_type_get_alloc_size (ggml-metal.cpp) so the op's
 // own destination-tensor buffer reserves the extra bytes at allocation time.
 size_t ggml_metal_op_flash_attn_train_back_extra_delta(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_train_back_extra_dsw  (const struct ggml_tensor * op);
 size_t ggml_metal_op_convrot8_extra(const struct ggml_tensor * op);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);

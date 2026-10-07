@@ -2624,6 +2624,11 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_raw(ggml_metal_buffer_t buf) {
+    struct ggml_metal_buffer_id res = { buf->buffers[0].metal, 0 };
+    return res;
+}
+
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 

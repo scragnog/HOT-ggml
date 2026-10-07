@@ -5470,6 +5470,65 @@ size_t ggml_metal_op_flash_attn_train_back_extra_delta(const ggml_tensor * op) {
     return GGML_PAD(sizeof(float)*Nh*S*Bn, 32);
 }
 
+// HOT-Step: dS-materialization (DSW) of the FA-train backward. The plan is shared by the allocation size
+// (ggml_backend_metal_buffer_type_get_alloc_size) and the encoder, so the dS scratch lives in the op's own
+// destination buffer (after dQ|dK|dV and delta) and is covered by the graph allocator's lifetime reuse.
+struct hs_fa_dsw_plan {
+    bool   use;
+    int    hkg;     // kv heads per group
+    size_t bytes;   // scratch bytes for one group
+};
+
+static hs_fa_dsw_plan hs_fa_dsw_plan_get(const ggml_tensor * op) {
+    hs_fa_dsw_plan p = { false, 1, 0 };
+
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * mask = op->src[3];
+
+    const int64_t D    = q->ne[0];
+    const int64_t S    = q->ne[1];
+    const int64_t Nh   = q->ne[2];
+    const int64_t Bn   = q->ne[3];
+    const int64_t S_kv = k->ne[1];
+    const int64_t Nkv  = k->ne[2];
+
+    const int32_t causal_prefix = flash_attn_train_causal_hint(op);
+    const int32_t kgs           = ggml_flash_attn_train_get_kv_grad_start(op);
+
+    const char * dsw_e = getenv("GGML_METAL_FA_TRAIN_DSW");
+    const char * mm_q  = getenv("GGML_METAL_FA_TRAIN_MM3_BWD");
+    const char * mm_kv = getenv("GGML_METAL_FA_TRAIN_MM3_BWD_KV");
+    const bool req = !(dsw_e && strcmp(dsw_e, "0") == 0);   // default ON; GGML_METAL_FA_TRAIN_DSW=0 selects the recompute kernels
+    const bool ok  = ((causal_prefix >= 0 && kgs == 0) || (causal_prefix < 0 && !mask)) && (D == 64 || D == 128) &&
+                     !(mm_q && strcmp(mm_q, "0") == 0) && !(mm_kv && strcmp(mm_kv, "0") == 0);
+    if (!(req && ok) || Nkv <= 0) {
+        return p;
+    }
+
+    const int G = (int) (Nh / Nkv);
+    int hkg = 2;
+    if (const char * e = getenv("GGML_METAL_FA_TRAIN_DSW_HKG")) hkg = atoi(e);
+    if (hkg < 1) hkg = 1;
+    if (hkg > Nkv) hkg = (int) Nkv;
+
+    const int64_t jstart = causal_prefix >= 0 ? 0 : (kgs/48)*48;   // 48 = dK block (6 simdgroups x 8 keys)
+    const int64_t nIt = (S + 7)/8;
+    const int64_t nJt = (S_kv - jstart + 7)/8;
+
+    p.use   = true;
+    p.hkg   = hkg;
+    p.bytes = (size_t) hkg*G*Bn*nIt*nJt*64*sizeof(float);
+    return p;
+}
+
+size_t ggml_metal_op_flash_attn_train_back_extra_dsw(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    const hs_fa_dsw_plan p = hs_fa_dsw_plan_get(op);
+    return p.use ? p.bytes + 256 : 0;   // 256: slack for the aligned start
+}
+
 // HOT-Step: FLASH_ATTN_TRAIN_BACK (kernel #7 backward). Three dispatches:
 // delta precompute, then dQ and dK|dV on disjoint output regions (no
 // barrier needed between THOSE two -- see the kernels' own comments in
@@ -5534,6 +5593,11 @@ int ggml_metal_op_flash_attn_train_back(ggml_metal_op_t ctx, int idx) {
         /*.offs_dv  =*/ offs_dv,
         /*.kv_grad_start =*/ ggml_flash_attn_train_get_kv_grad_start(op),
         /*.causal_prefix =*/ flash_attn_train_causal_hint(op),
+        /*.hk0           =*/ 0,
+        /*.ds_h0         =*/ 0,
+        /*.ds_var        =*/ [] { const char * e = getenv("GGML_METAL_FA_TRAIN_DSW_VAR"); return e ? atoi(e) : 1; }(),
+        /*.jlim          =*/ 0,
+        /*.jstart        =*/ 0,
     };
 
     auto pipeline_delta = ggml_metal_library_get_pipeline_flash_attn_train_delta(lib, op);
@@ -5566,6 +5630,161 @@ int ggml_metal_op_flash_attn_train_back(ggml_metal_op_t ctx, int idx) {
     // delta is now fully written; both passes below only read it, but
     // neither may start until every delta write from pass 0 is visible.
     ggml_metal_op_concurrency_reset(ctx);
+
+    // Opt-in (GGML_METAL_FA_TRAIN_DSW=1): dS materialization. Causal, kv_grad_start == 0, D 64/128.
+    // dV runs first on its own; then per group of GGML_METAL_FA_TRAIN_DSW_HKG kv heads (default 2):
+    // the dK kernel also writes dS as 8x8 f32 tiles into a persistent scratch buffer, a barrier, then a light
+    // dQ kernel reads those tiles (no S/dP/exp recompute). Same per-element math and accumulation order as
+    // the default kernels (operand-swap symmetry: tools/simdgroup-swap-test.mm); verified by fattn-train-test.
+    {
+        const char * dsw_e = getenv("GGML_METAL_FA_TRAIN_DSW");
+        const char * mm_q  = getenv("GGML_METAL_FA_TRAIN_MM3_BWD");
+        const char * mm_kv = getenv("GGML_METAL_FA_TRAIN_MM3_BWD_KV");
+        const bool dsw_req = !(dsw_e && strcmp(dsw_e, "0") == 0);   // default ON; GGML_METAL_FA_TRAIN_DSW=0 selects the recompute kernels
+        const bool dsw_ok  = ((args.causal_prefix >= 0 && args.kv_grad_start == 0) || (args.causal_prefix < 0 && !args.has_mask)) && (args.D == 64 || args.D == 128) &&
+                             !(mm_q && strcmp(mm_q, "0") == 0) && !(mm_kv && strcmp(mm_kv, "0") == 0);
+        if (dsw_req && dsw_ok) {
+            #define HOT_STEP_FA_TRAIN_BKV_NQ  8    // keep in sync with ggml-metal.metal
+            #define HOT_STEP_FA_TRAIN_SPAD    1    // keep in sync with ggml-metal.metal
+            const int nsg_dv = hot_step_fa_nsg_env("GGML_METAL_FA_TRAIN_BDV_NSG", 12);
+            const int nsg_dk = 6;
+            const bool causal_dsw = args.causal_prefix >= 0;
+            // non-causal (NAR): dK blocks wholly inside the detached prefix write no dS; the old dQ kernel does those keys first
+            const int jstart = causal_dsw ? 0 : (int) ((args.kv_grad_start/(nsg_dk*8))*(nsg_dk*8));
+            const int nsg_q  = hot_step_fa_nsg_env("GGML_METAL_FA_TRAIN_DSW_NSG", 8) == 4 ? 4 : 8;
+            const int nc_q   = [] { const char * e = getenv("GGML_METAL_FA_TRAIN_DSW_NC"); const int v = e ? atoi(e) : 16; return (v == 8 || v == 32) ? v : 16; }();
+            const int G      = (int) (Nh / Nkv);
+            const int hkg    = [&] { const char * e = getenv("GGML_METAL_FA_TRAIN_DSW_HKG"); int v = e ? atoi(e) : 2; if (v < 1) v = 1; if (v > Nkv) v = (int) Nkv; return v; }();
+
+            const hs_fa_dsw_plan plan = hs_fa_dsw_plan_get(op);
+            GGML_ASSERT(plan.use && plan.hkg == hkg);   // same conditions as the allocation size
+            ggml_metal_buffer_id bid_ds = bid_dst;
+            bid_ds.offs = GGML_PAD(bid_dst.offs + ggml_nbytes(op) + ggml_metal_op_flash_attn_train_back_extra_delta(op), 256);
+            {
+                static bool info_ds = false;
+                if (!info_ds) {
+                    info_ds = true;
+                    fprintf(stderr, "[fa-train-dsw] dS scratch %.1f MiB per op, inside the op's buffer (hkg=%d G=%d S=%lld S_kv=%lld)\n",
+                            plan.bytes/1048576.0, hkg, G, (long long) S, (long long) S_kv);
+                }
+            }
+
+            auto pipeline_dv  = ggml_metal_library_get_pipeline_flash_attn_train_back_dv_mm(lib, op, causal_dsw, nsg_dv);
+            auto pipeline_dkw = ggml_metal_library_get_pipeline_flash_attn_train_back_dk_dsw(lib, op, causal_dsw);
+            auto pipeline_dqs = ggml_metal_library_get_pipeline_flash_attn_train_back_dq_ds(lib, op, nsg_q, nc_q);
+
+            const int64_t LDk = args.D + 1;
+            const size_t  smem_dv = (size_t) (2*HOT_STEP_FA_TRAIN_BKV_NQ*LDk + nsg_dv*8*(HOT_STEP_FA_TRAIN_BKV_NQ + HOT_STEP_FA_TRAIN_SPAD) +
+                                              2*HOT_STEP_FA_TRAIN_BKV_NQ + nsg_dv) * sizeof(float);
+            const size_t  smem_dk = (size_t) (2*HOT_STEP_FA_TRAIN_BKV_NQ*LDk + 2*nsg_dk*8*(HOT_STEP_FA_TRAIN_BKV_NQ + HOT_STEP_FA_TRAIN_SPAD) +
+                                              2*HOT_STEP_FA_TRAIN_BKV_NQ + nsg_dk) * sizeof(float);
+            const size_t  smem_qs = (size_t) (nc_q*LDk + nsg_q*64) * sizeof(float);
+            const ggml_metal_device_props * props_ds = ggml_metal_device_get_props(ctx->dev);
+            GGML_ASSERT(smem_dv <= props_ds->max_theadgroup_memory_size);
+            GGML_ASSERT(smem_dk <= props_ds->max_theadgroup_memory_size);
+            GGML_ASSERT(smem_qs <= props_ds->max_theadgroup_memory_size);
+            GGML_ASSERT(nsg_dv*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_dv));
+            GGML_ASSERT(nsg_dk*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_dkw));
+            GGML_ASSERT(nsg_q*32  <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_dqs));
+
+            const ggml_metal_buffer_id bid_q = ggml_metal_get_buffer_id(q);
+            const ggml_metal_buffer_id bid_k = ggml_metal_get_buffer_id(k);
+            const ggml_metal_buffer_id bid_v = ggml_metal_get_buffer_id(v);
+            const ggml_metal_buffer_id bid_m = mask ? ggml_metal_get_buffer_id(mask) : bid_q;
+            const ggml_metal_buffer_id bid_f = ggml_metal_get_buffer_id(fwd);
+            const ggml_metal_buffer_id bid_df = ggml_metal_get_buffer_id(dfwd);
+
+            // NAR hybrid prefix pass: the old dQ kernel over the detached-prefix keys [0, jstart) for every head. Its accumulator
+            // (stored as dQ, exact f32) is the start value of the DSW reader, so the summation chain is the one of a single pass.
+            if (jstart > 0) {
+                const int nsg_p = hot_step_fa_nsg_env("GGML_METAL_FA_TRAIN_BDQ_NSG", 4);
+                auto pipeline_p = ggml_metal_library_get_pipeline_flash_attn_train_back_dq_mm(lib, op, false, nsg_p);
+                const size_t smem_p = (size_t) (2*8*LDk + 2*nsg_p*8*(8 + HOT_STEP_FA_TRAIN_SPAD) + nsg_p) * sizeof(float);   // BDQ_NC = 8
+                GGML_ASSERT(smem_p <= props_ds->max_theadgroup_memory_size);
+                GGML_ASSERT(nsg_p*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_p));
+                ggml_metal_kargs_flash_attn_train_back a_pre = args;
+                a_pre.jlim = jstart;
+                ggml_metal_encoder_set_pipeline(enc, pipeline_p);
+                ggml_metal_encoder_set_bytes   (enc, &a_pre, sizeof(a_pre), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_q, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_k, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_v, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_m, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_f, 5);
+                ggml_metal_encoder_set_buffer  (enc, bid_df, 6);
+                ggml_metal_encoder_set_buffer  (enc, bid_delta, 7);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,   8);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(smem_p, 16), 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (S + nsg_p*8 - 1)/(nsg_p*8), Nh, Bn, 32, nsg_p, 1);
+                ggml_metal_op_concurrency_reset(ctx);   // partial dQ complete before the readers continue from it
+            }
+
+            // DIAGNOSTIC ONLY (wrong results): GGML_METAL_FA_TRAIN_DSW_SKIP=dv|dq|dk drops that dispatch to time its share
+            const char * skip_e = getenv("GGML_METAL_FA_TRAIN_DSW_SKIP");
+            const bool skip_dv = skip_e && strcmp(skip_e, "dv") == 0;
+            const bool skip_dq = skip_e && strcmp(skip_e, "dq") == 0;
+            const bool skip_dk = skip_e && strcmp(skip_e, "dk") == 0;
+
+            // dV (all kv heads, own dispatch)
+            if (!skip_dv) {
+                const int64_t ntiles_kv = (S_kv + nsg_dv*8 - 1)/(nsg_dv*8);
+                ggml_metal_encoder_set_pipeline(enc, pipeline_dv);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_q, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_k, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_v, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_m, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_f, 5);
+                ggml_metal_encoder_set_buffer  (enc, bid_df, 6);
+                ggml_metal_encoder_set_buffer  (enc, bid_delta, 7);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,   8);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(smem_dv, 16), 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, ntiles_kv, Nkv, Bn, 32, nsg_dv, 1);
+            }
+
+            for (int64_t hk0 = 0; hk0 < Nkv; hk0 += hkg) {
+                const int nhk = (int) std::min<int64_t>(hkg, Nkv - hk0);
+                ggml_metal_kargs_flash_attn_train_back a2 = args;
+                a2.hk0   = (int32_t) hk0;
+                a2.ds_h0 = (int32_t) (hk0*G);
+                a2.jstart = jstart;
+
+                // dK + dS tiles
+                if (!skip_dk) {
+                    const int64_t ntiles_kv = (S_kv + nsg_dk*8 - 1)/(nsg_dk*8);
+                    ggml_metal_encoder_set_pipeline(enc, pipeline_dkw);
+                    ggml_metal_encoder_set_bytes   (enc, &a2, sizeof(a2), 0);
+                    ggml_metal_encoder_set_buffer  (enc, bid_q, 1);
+                    ggml_metal_encoder_set_buffer  (enc, bid_k, 2);
+                    ggml_metal_encoder_set_buffer  (enc, bid_v, 3);
+                    ggml_metal_encoder_set_buffer  (enc, bid_m, 4);
+                    ggml_metal_encoder_set_buffer  (enc, bid_f, 5);
+                    ggml_metal_encoder_set_buffer  (enc, bid_df, 6);
+                    ggml_metal_encoder_set_buffer  (enc, bid_delta, 7);
+                    ggml_metal_encoder_set_buffer  (enc, bid_dst,   8);
+                    ggml_metal_encoder_set_buffer  (enc, bid_ds,    9);
+                    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(smem_dk, 16), 0);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, ntiles_kv, nhk, Bn, 32, nsg_dk, 1);
+                }
+                ggml_metal_op_concurrency_reset(ctx);   // dS tiles complete before the reader
+                // dQ from dS
+                if (!skip_dq) {
+                    const int64_t ntiles_q = (S + nsg_q*8 - 1)/(nsg_q*8);
+                    ggml_metal_encoder_set_pipeline(enc, pipeline_dqs);
+                    ggml_metal_encoder_set_bytes   (enc, &a2, sizeof(a2), 0);
+                    ggml_metal_encoder_set_buffer  (enc, bid_k, 1);
+                    ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+                    ggml_metal_encoder_set_buffer  (enc, bid_ds,  3);
+                    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(smem_qs, 16), 0);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, ntiles_q, nhk*G, Bn, 32, nsg_q, 1);
+                }
+                ggml_metal_op_concurrency_reset(ctx);   // reader done before the next group overwrites the scratch
+            }
+            #undef HOT_STEP_FA_TRAIN_BKV_NQ
+            #undef HOT_STEP_FA_TRAIN_SPAD
+            return 1;
+        }
+    }
 
     // Pass A: dQ. Grid (ceil(S/HOT_STEP_FA_TRAIN_NSG), Nh, Bn).
     {

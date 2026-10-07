@@ -777,6 +777,11 @@ typedef struct {
     uint64_t offs_dq, offs_dk, offs_dv; // within dst (ggml_flash_attn_train_back_offsets)
     int32_t  kv_grad_start;          // dK/dV rows < this are never read: dkdv writes zeros
     int32_t  causal_prefix;          // B6 causal hint, -1: none
+    int32_t  hk0;                    // dS-materialization (GGML_METAL_FA_TRAIN_DSW): first kv head of this group
+    int32_t  ds_h0;                  // first q head of this group (= hk0*G); scratch is indexed by h - ds_h0
+    int32_t  ds_var;                 // DSW experiment: how the scratch dS rounds scale*S - LSE (0 = as dK, 1 = fma = matches the dQ kernel bitwise [default], 2 = no fma)
+    int32_t  jlim;                   // old dQ kernel only: stop at this key (NAR hybrid prefix pass), 0 = no limit
+    int32_t  jstart;                 // DSW: first key whose dS tile is in the scratch (kv_grad_start rounded down to the dK block)
 } ggml_metal_kargs_flash_attn_train_back;
 
 typedef struct {

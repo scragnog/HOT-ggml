@@ -175,6 +175,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dv_mm(ggml_metal_library_t lib, const struct ggml_tensor * op, bool causal, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dk_mm(ggml_metal_library_t lib, const struct ggml_tensor * op, bool causal, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dkdv (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dk_dsw(ggml_metal_library_t lib, const struct ggml_tensor * op, bool causal);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dq_ds (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nc);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col_ic         (ggml_metal_library_t lib, const struct ggml_tensor * op);  // HOT-Step patch: metal-im2col-ic, default path for N==1 1D convs (see kernels/conv.metal's kernel_im2col_ic)
@@ -378,6 +380,8 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+// whole first Metal buffer (offset 0); for standalone scratch buffers made with ggml_metal_buffer_init
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_raw(ggml_metal_buffer_t buf);
 
 #ifdef __cplusplus
 }

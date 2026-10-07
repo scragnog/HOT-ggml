@@ -2340,6 +2340,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train
     return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, "kernel_flash_attn_train_back_dq_f32", op->src[0]->ne[0]);
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dk_dsw(ggml_metal_library_t lib, const ggml_tensor * op, bool causal) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, causal ? "kernel_flash_attn_train_back_dk_dsw_mm_n6_causal_f32" : "kernel_flash_attn_train_back_dk_dsw_mm_n6_f32", op->src[0]->ne[0]);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dq_ds(ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nc) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    char nm[128];
+    snprintf(nm, sizeof(nm), "kernel_flash_attn_train_back_dq_ds_n%d_c%d_causal_f32", nsg, nc);
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, nm, op->src[0]->ne[0]);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dkdv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
 
