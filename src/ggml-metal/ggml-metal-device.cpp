@@ -96,6 +96,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_l
     return res;
 }
 
+// HOT-Step: vectorised f32 copy, see kernel_cpy_f32_f32_v4
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_v4(ggml_metal_library_t lib) {
+    const char * base = "kernel_cpy_f32_f32_v4";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d(ggml_metal_library_t lib, const ggml_tensor * op, ggml_op_pool op_pool) {
     GGML_ASSERT(ggml_is_contiguous(op->src[0]));
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 && op->src[0]->type == op->type);
@@ -215,6 +227,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat(ggml_meta
     return res;
 }
 
+// HOT-Step: REPEAT_BACK -- only kernel_repeat_back_f32 exists (matches
+// ggml-cpu's own repeat_back, which is F32-only), so op->type is not
+// consulted -- mirrors how get_pipeline_silu_back above is scoped.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_REPEAT_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_repeat_back_%s", ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_metal_library_t lib, ggml_type tsrc) {
     char base[256];
     char name[256];
@@ -270,6 +302,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal
                 case GGML_UNARY_OP_ROUND:       op_num = OP_UNARY_NUM_ROUND;       break;
                 case GGML_UNARY_OP_TRUNC:       op_num = OP_UNARY_NUM_TRUNC;       break;
                 case GGML_UNARY_OP_XIELU:       op_num = OP_UNARY_NUM_XIELU;       break;
+                case GGML_UNARY_OP_BF16_ROUND:  op_num = OP_UNARY_NUM_BF16_ROUND;  break;
                 default: GGML_ABORT("fatal error");
             } break;
         default: GGML_ABORT("fatal error");
@@ -1906,7 +1939,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse, bool round_epilogue) {
     char base[256];
     char name[256];
 
@@ -1930,16 +1963,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_l
     const bool is_rb = ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && (ggml_nrows(op->src[1]) == 1) && ggml_nelements(op) < 65536;
 
     snprintf(base, 256, "kernel_bin_fuse_%s_%s_%s%s", t0_str, t1_str, t_str, is_c4 ? "_4" : "");
-    snprintf(name, 256, "%s_op=%d_nf=%d_rb=%d_cb=%d", base, op_num, n_fuse, is_rb, is_cb);
+    snprintf(name, 256, "%s_op=%d_nf=%d_rb=%d_cb=%d_rnd=%d", base, op_num, n_fuse, is_rb, is_cb, round_epilogue);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
-        ggml_metal_cv_set_int16(cv, op_num, FC_BIN + 0);
-        ggml_metal_cv_set_int16(cv, n_fuse, FC_BIN + 1);
-        ggml_metal_cv_set_bool (cv, is_rb,  FC_BIN + 2);
-        ggml_metal_cv_set_bool (cv, is_cb,  FC_BIN + 3);
+        ggml_metal_cv_set_int16(cv, op_num,         FC_BIN + 0);
+        ggml_metal_cv_set_int16(cv, n_fuse,         FC_BIN + 1);
+        ggml_metal_cv_set_bool (cv, is_rb,          FC_BIN + 2);
+        ggml_metal_cv_set_bool (cv, is_cb,          FC_BIN + 3);
+        ggml_metal_cv_set_bool (cv, round_epilogue, FC_BIN + 4);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1976,6 +2010,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one(ggml_met
         ggml_metal_cv_set_int16(cv, op_num, FC_BIN + 0);
         ggml_metal_cv_set_int16(cv, 1,      FC_BIN + 1);
         ggml_metal_cv_set_bool (cv, false,  FC_BIN + 2);
+        ggml_metal_cv_set_bool (cv, false,  FC_BIN + 4);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -2113,6 +2148,216 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale(ggml_
     res.smem = 32*sizeof(float);
 
     return res;
+}
+
+// HOT-Step: RMS_NORM_BACK. smem is 64 floats (2x the forward RMS_NORM's 32)
+// -- the kernel packs two per-simdgroup partial sums (sum_xx, sum_xdz) into
+// one threadgroup buffer, each needing up to 32 slots (max simdgroups per
+// threadgroup, since a threadgroup is at most 1024 threads = 32 simdgroups
+// of 32 lanes).
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_RMS_NORM_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_rms_norm_back_%s", ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.smem = 64*sizeof(float);
+
+    return res;
+}
+
+// HOT-Step: CONVROT8 / CONVROT8_BACK. smem is data-dependent (varies per op
+// instance with `in`), so it's computed and set directly in
+// ggml_metal_op_convrot8{,_back} rather than here -- same pattern as the
+// flash-attention kernels' pipeline getter (ggml_metal_library_get_pipeline_flash_attn_ext).
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_convrot8(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_CONVROT8);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_convrot8_%s", ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_convrot8_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_CONVROT8_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_convrot8_back_%s", ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// HOT-Step: tiled CONVROT8 kernels (no function constants, fixed name).
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_convrot8_named(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+// HOT-Step: OUT_PROD (kernel #6), F32-only.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_OUT_PROD);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_out_prod_%s", ggml_type_name(op->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// HOT-Step: FLASH_ATTN_TRAIN / FLASH_ATTN_TRAIN_BACK (kernel #7). F32-only
+// (unlike OUT_PROD's ggml_type_name-based name), but D-specialized since the
+// 2026-09-22 register-accumulator redesign (see ggml-metal.metal's own
+// comment above kernel_flash_attn_train_f32): D is a compile-time template
+// parameter, explicitly instantiated for D in {64, 128} only (this
+// project's own head_dim is 128, yue2-aitk-graph.h; 64 mirrors the CUDA
+// port's own scope, fattn-train.cu) -- ggml_metal_device_supports_op gates
+// on the same set, so a q->ne[0] outside it never reaches here.
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_named(
+        ggml_metal_library_t lib, const char * base, int64_t D) {
+    GGML_ASSERT(D == 64 || D == 128);
+
+    char name[256];
+    snprintf(name, sizeof(name), "%s_d%lld", base, (long long) D);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, "kernel_flash_attn_train_f32", op->src[0]->ne[0]);
+}
+
+// EXPERIMENTAL simdgroup_matrix forward kernel, opt-in via
+// GGML_METAL_FA_TRAIN_MM=1 (default off). See
+// docs/perf-notes/fa-train-simdgroup-matrix-plan.md and
+// kernel_flash_attn_train_mm_f32's own comment in ggml-metal.metal --
+// NOT numerically validated yet, do not enable for a real training run
+// before that validation has passed.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, "kernel_flash_attn_train_mm_f32", op->src[0]->ne[0]);
+}
+
+// EXPERIMENTAL (B3) two-pass simdgroup_matrix forward kernel, opt-in via
+// GGML_METAL_FA_TRAIN_MM3=1 (default off), see kernel_flash_attn_train_mm3_f32
+// in ggml-metal.metal.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_mm3(ggml_metal_library_t lib, const ggml_tensor * op, bool causal) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, causal ? "kernel_flash_attn_train_mm3_causal_f32" : "kernel_flash_attn_train_mm3_f32", op->src[0]->ne[0]);
+}
+
+// EXPERIMENTAL (Weg 1) single-pass online-softmax forward, opt-in via GGML_METAL_FA_TRAIN_MM3_1P=1.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_mm3_1p(ggml_metal_library_t lib, const ggml_tensor * op, bool causal, int nsg, int nc) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN);
+
+    char nm[160];
+    snprintf(nm, sizeof(nm), "kernel_flash_attn_train_mm3_1p_n%d_c%d%s_f32", nsg, nc, causal ? "_causal" : "");
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, nm, op->src[0]->ne[0]);
+}
+
+// HOT-Step: precomputes delta[r] = sum_d dO[d,r]*O[d,r], read back by both
+// backward passes below -- see kernel_flash_attn_train_delta_f32's own
+// comment in ggml-metal.metal.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_delta(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, "kernel_flash_attn_train_delta_f32", op->src[0]->ne[0]);
+}
+
+// EXPERIMENTAL (B3c) simdgroup_matrix dV / dK kernels, opt-in via GGML_METAL_FA_TRAIN_MM3_BWD_KV=1.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dv_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool causal, int nsg) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    char nm[160];
+    snprintf(nm, sizeof(nm), "kernel_flash_attn_train_back_dv_mm%s%s_f32", nsg == 8 ? "" : ("_n" + std::to_string(nsg)).c_str(), causal ? "_causal" : "");
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, nm, op->src[0]->ne[0]);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dk_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool causal, int nsg) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    char nm[160];
+    snprintf(nm, sizeof(nm), "kernel_flash_attn_train_back_dk_mm%s%s_f32", nsg == 8 ? "" : ("_n" + std::to_string(nsg)).c_str(), causal ? "_causal" : "");
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, nm, op->src[0]->ne[0]);
+}
+
+// EXPERIMENTAL (B3b) simdgroup_matrix dQ kernel, opt-in via GGML_METAL_FA_TRAIN_MM3_BWD=1.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dq_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool causal, int nsg) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    char nm[160];
+    snprintf(nm, sizeof(nm), "kernel_flash_attn_train_back_dq_mm%s%s_f32", nsg == 8 ? "" : ("_n" + std::to_string(nsg)).c_str(), causal ? "_causal" : "");
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, nm, op->src[0]->ne[0]);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dq(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, "kernel_flash_attn_train_back_dq_f32", op->src[0]->ne[0]);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dk_dsw(ggml_metal_library_t lib, const ggml_tensor * op, bool causal) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, causal ? "kernel_flash_attn_train_back_dk_dsw_mm_n6_causal_f32" : "kernel_flash_attn_train_back_dk_dsw_mm_n6_f32", op->src[0]->ne[0]);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dq_ds(ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nc) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    char nm[128];
+    snprintf(nm, sizeof(nm), "kernel_flash_attn_train_back_dq_ds_n%d_c%d_causal_f32", nsg, nc);
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, nm, op->src[0]->ne[0]);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_train_back_dkdv(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_metal_library_get_pipeline_flash_attn_train_named(lib, "kernel_flash_attn_train_back_dkdv_f32", op->src[0]->ne[0]);
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_library_t lib, const ggml_tensor * op) {

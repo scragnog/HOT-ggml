@@ -5757,6 +5757,58 @@ enum ggml_prec ggml_flash_attn_train_get_prec(
     return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
 }
 
+// HOT-Step patch: flash-attn-train -- op_params slot 4, see ggml.h.
+void ggml_flash_attn_train_set_kv_grad_start(
+        struct ggml_tensor * a,
+        int32_t              n) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_TRAIN || a->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+    GGML_ASSERT(n >= 0);
+
+    ggml_set_op_params_i32(a, 4, n);
+}
+
+int32_t ggml_flash_attn_train_get_kv_grad_start(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_TRAIN || a->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_get_op_params_i32(a, 4);
+}
+
+// HOT-Step patch: flash-attn-train -- op_params slot 5 holds prefix + 1 (0 = no hint), see ggml.h.
+void ggml_flash_attn_train_set_causal(
+        struct ggml_tensor * a,
+        int32_t              prefix) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_TRAIN || a->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+    GGML_ASSERT(prefix >= 0);
+
+    ggml_set_op_params_i32(a, 5, prefix + 1);
+}
+
+int32_t ggml_flash_attn_train_get_causal(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_TRAIN || a->op == GGML_OP_FLASH_ATTN_TRAIN_BACK);
+
+    return ggml_get_op_params_i32(a, 5) - 1;
+}
+
+// HOT-Step patch: flash-attn-train -- src[4] = saved forward result, see ggml.h.
+void ggml_flash_attn_train_set_saved(
+        struct ggml_tensor * packed,
+        struct ggml_tensor * saved) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN);
+    GGML_ASSERT(saved != NULL && saved != packed);
+    GGML_ASSERT(saved->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(saved));
+    GGML_ASSERT(ggml_nelements(saved) == ggml_nelements(packed));
+
+    packed->src[4] = saved;
+}
+
+struct ggml_tensor * ggml_flash_attn_train_get_saved(const struct ggml_tensor * packed) {
+    GGML_ASSERT(packed->op == GGML_OP_FLASH_ATTN_TRAIN);
+    return packed->src[4];
+}
+
 struct ggml_tensor * ggml_flash_attn_train_get_o(
         struct ggml_context * ctx,
         struct ggml_tensor  * packed) {
@@ -7666,6 +7718,10 @@ static void ggml_compute_backward(
                 // rounding -- small enough to slip under a tolerance gate, and
                 // wrong in kind. This is the only place that can guarantee it.
                 ggml_flash_attn_train_set_prec(bk, ggml_flash_attn_train_get_prec(tensor));
+                ggml_flash_attn_train_set_kv_grad_start(bk, ggml_flash_attn_train_get_kv_grad_start(tensor));
+                if (ggml_flash_attn_train_get_causal(tensor) >= 0) {
+                    ggml_flash_attn_train_set_causal(bk, ggml_flash_attn_train_get_causal(tensor));
+                }
 
                 if (src0_needs_grads) {
                     ggml_add_or_set(ctx, cgraph, isrc0, ggml_flash_attn_train_back_get_dq(ctx, bk));

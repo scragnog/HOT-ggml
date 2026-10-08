@@ -167,6 +167,7 @@
 #define OP_UNARY_NUM_ROUND       119
 #define OP_UNARY_NUM_TRUNC       120
 #define OP_UNARY_NUM_XIELU       121
+#define OP_UNARY_NUM_BF16_ROUND  122
 
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
@@ -291,6 +292,30 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_repeat;
+
+// HOT-Step: REPEAT_BACK -- see kernel_repeat_back_f32 in ggml-metal.metal.
+// Field shape mirrors ggml_metal_kargs_repeat above: ne00../nb00.. is the
+// LARGER (src0, the incoming gradient) tensor, ne0../nb0.. is the SMALLER
+// (dst) tensor being reduced into -- same roles ggml-cpu/ops.cpp's
+// ggml_compute_forward_repeat_back_f32 uses via GGML_TENSOR_UNARY_OP_LOCALS.
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_repeat_back;
 
 typedef struct {
     int64_t  nk0;
@@ -507,6 +532,16 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mm;
 
+// HOT-Step (B9): f32 x f32 mul_mat with a fixed reduction length K = 32 (LoRA rank)
+// on simdgroup_float8x8 -- kernel_mul_mm_k32_f32. dst[m, n] = sum_k src0[k, m] * src1[k, n].
+typedef struct {
+    int32_t  M;     // ne01 (multiple of 64)
+    int32_t  N;     // ne11
+    uint64_t nb01;  // src0 row stride (bytes), K contiguous
+    uint64_t nb11;  // src1 row stride (bytes)
+    uint64_t nb1;   // dst  row stride (bytes), M contiguous
+} ggml_metal_kargs_mul_mm_k32;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
@@ -628,6 +663,126 @@ typedef struct {
     uint64_t nbf3[3];
     float    scale;
 } ggml_metal_kargs_norm;
+
+// HOT-Step: RMS_NORM_BACK. dz (src0) and x (src1) each get their own
+// per-row strides (nb0x / nb1x) even though supports_op in
+// ggml-metal-device.m requires them same-shape -- mirrors how this file's
+// mul_mv_id-style structs keep src0/src1 strides separate rather than
+// assuming a shared layout. nb00/nb10 are omitted: supports_op also
+// requires both contiguous within a row (nb[0] == sizeof(float)).
+typedef struct {
+    int32_t  ne00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_rms_norm_back;
+
+// HOT-Step: CONVROT8 / CONVROT8_BACK. Everything else (row strides) is
+// implied by `in`/`out` since ggml_convrot8()'s own constructor in ggml.c
+// requires weight/x/scales/(bias) all fully contiguous -- see the kernels'
+// own comments in ggml-metal.metal for the full design.
+typedef struct {
+    int32_t in;
+    int32_t out;
+    int32_t rotation;
+    int32_t use_bf16;
+    int32_t has_bias;
+    int32_t rows;     // HOT-Step: used by the tiled kernels only
+} ggml_metal_kargs_convrot8;
+
+typedef struct {
+    int32_t in;
+    int32_t out;
+    int32_t rotation;
+    int32_t use_bf16;
+    int32_t rows;     // HOT-Step: used by the tiled kernels only
+    int32_t wexp;     // HOT-Step: half-MMA backward (hs): weight scale 2^wexp
+} ggml_metal_kargs_convrot8_back;
+
+// HOT-Step: OUT_PROD (kernel #6). F32-only -- this project's LoRA/adapter
+// matmuls (yue2_aitk_graph::linear()'s own comment: "FP32 trainables and
+// FP32 LoRA math") are the only source of the AR block's 16 OUT_PROD nodes,
+// so unlike the CPU reference (ggml-cpu/ops.cpp's 3-type-variant
+// ggml_compute_forward_out_prod) this only needs the F32xF32->F32 path.
+// dst's own nb0 is not carried (always sizeof(float) -- ggml_out_prod()
+// always allocates a fresh, contiguous result tensor in ggml.c).
+typedef struct {
+    int32_t  ne00; // = dst->ne[0] = src0->ne[0]  (output row width)
+    int32_t  ne01; // reduction dim, shared: src0->ne[1] == src1->ne[1]
+    int32_t  dps2; // dst->ne[2] / src0->ne[2]  (GQA broadcast factor)
+    int32_t  dps3; // dst->ne[3] / src0->ne[3]
+    uint64_t nb00, nb01, nb02, nb03; // src0 strides
+    uint64_t nb10, nb11, nb12, nb13; // src1 strides
+    uint64_t nb1,  nb2,  nb3;        // dst strides
+    // HOT-Step: used by the tiled kernel only (kernel_out_prod_mm_f32).
+    int32_t  ne1, ne2, ne3;
+} ggml_metal_kargs_out_prod;
+
+// HOT-Step: FLASH_ATTN_TRAIN / FLASH_ATTN_TRAIN_BACK (kernel #7, last of
+// docs/plans/yue2-joint-training-metal-port.md's Phase 3). F32 scalar port
+// only -- see ggml-metal.metal's own comment on kernel_flash_attn_train_f32
+// for the two-pass-per-row design and why it deliberately does not attempt
+// llama.cpp's tiled/simdgroup-matrix FLASH_ATTN_EXT kernel's performance
+// tricks (out of scope: this closes the Metal support gap, a fast path is a
+// follow-up). Mirrors ggml-cpu/ops.cpp's
+// ggml_compute_forward_flash_attn_train_f32 exactly in math, not in
+// per-thread tiling -- see engine/patches/flash-attn-train.patch's own CPU
+// implementation, ported from a BQ/BK-tiled multi-thread scan to one thread
+// per (b,h,i) query row scanning all of S_kv, which is the same online-
+// softmax recurrence at a different (finer) grouping and so is NOT
+// bit-exact against the CPU oracle -- this is a tolerance-gated kernel, see
+// engine/tools/fattn-train-test.cpp's own --backend metal (PASS_REL 1e-4f,
+// the same bar this project's CUDA F32 path is already held to).
+typedef struct {
+    int32_t  D;
+    int32_t  S;
+    int32_t  Nh;
+    int32_t  Bn;
+    int32_t  S_kv;
+    int32_t  Nkv;
+    int32_t  G;         // Nh / Nkv, GQA group size
+    float    scale;
+    int32_t  has_mask;
+    int32_t  mne0, mne1, mne2, mne3; // mask->ne (dummy 1s when has_mask==0)
+    uint64_t nb01, nb02, nb03;       // q strides (nb00 always sizeof(float))
+    uint64_t nb11, nb12, nb13;       // k strides
+    uint64_t nb21, nb22, nb23;       // v strides
+    uint64_t offs_lse;               // byte offset of the LSE region in dst
+                                      // (ggml_flash_attn_train_lse_offset)
+    int32_t  causal_prefix;          // B6 causal hint (ggml_flash_attn_train_get_causal), -1: none
+} ggml_metal_kargs_flash_attn_train;
+
+typedef struct {
+    int32_t  D;
+    int32_t  S;
+    int32_t  Nh;
+    int32_t  Bn;
+    int32_t  S_kv;
+    int32_t  Nkv;
+    int32_t  G;
+    float    scale;
+    int32_t  has_mask;
+    int32_t  mne0, mne1, mne2, mne3;
+    uint64_t nb01, nb02, nb03;       // q strides
+    uint64_t nb11, nb12, nb13;       // k strides
+    uint64_t nb21, nb22, nb23;       // v strides
+    uint64_t offs_lse;               // within fwd (src[4])
+    uint64_t offs_dq, offs_dk, offs_dv; // within dst (ggml_flash_attn_train_back_offsets)
+    int32_t  kv_grad_start;          // dK/dV rows < this are never read: dkdv writes zeros
+    int32_t  causal_prefix;          // B6 causal hint, -1: none
+    int32_t  hk0;                    // dS-materialization (GGML_METAL_FA_TRAIN_DSW): first kv head of this group
+    int32_t  ds_h0;                  // first q head of this group (= hk0*G); scratch is indexed by h - ds_h0
+    int32_t  ds_var;                 // DSW experiment: how the scratch dS rounds scale*S - LSE (0 = as dK, 1 = fma = matches the dQ kernel bitwise [default], 2 = no fma)
+    int32_t  jlim;                   // old dQ kernel only: stop at this key (NAR hybrid prefix pass), 0 = no limit
+    int32_t  jstart;                 // DSW: first key whose dS tile is in the scratch (kv_grad_start rounded down to the dK block)
+} ggml_metal_kargs_flash_attn_train_back;
 
 typedef struct {
     int32_t  ne00;

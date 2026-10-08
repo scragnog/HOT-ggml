@@ -2589,6 +2589,35 @@ extern "C" {
     GGML_API void           ggml_flash_attn_train_set_prec(struct ggml_tensor * a, enum ggml_prec prec);
     GGML_API enum ggml_prec ggml_flash_attn_train_get_prec(const struct ggml_tensor * a);
 
+    // HOT-Step patch: flash-attn-train -- dK/dV rows [0, n) of the KV sequence
+    // belong to a detached prefix whose gradient the caller never reads (the
+    // GGML_OP_SET that builds the KV canvas backpropagates only the view past
+    // the prefix). A backend MAY skip computing them and write zeros instead.
+    // Backends that ignore the hint stay correct. Default 0 = compute every row.
+    // Set it on the FORWARD node; ggml_compute_backward copies it to the
+    // backward node, like prec.
+    GGML_API void    ggml_flash_attn_train_set_kv_grad_start(struct ggml_tensor * a, int32_t n);
+    GGML_API int32_t ggml_flash_attn_train_get_kv_grad_start(const struct ggml_tensor * a);
+
+    // Causal hint (YuE2 B6): the caller promises the mask is exactly "key j visible iff
+    // j <= prefix + query row i". Backends may use it to skip whole key/query ranges without
+    // reading the mask; the mask is still applied, so a TRUE hint never changes a result.
+    // Only the Metal backend reads it. get returns -1 when no hint was set.
+    GGML_API void    ggml_flash_attn_train_set_causal(struct ggml_tensor * a, int32_t prefix);
+    GGML_API int32_t ggml_flash_attn_train_get_causal(const struct ggml_tensor * a);
+
+    // HOT-Step patch: flash-attn-train -- saved forward result (YuE2 B2).
+    // Attach the packed O+LSE result of an EARLIER compute of this very forward
+    // node (same q/k/v/mask, same op params) as src[4]. A backend that supports
+    // it then copies `saved` into the node's output instead of running the
+    // forward kernel; a backend that does not simply ignores src[4] and
+    // recomputes, so the hint never changes the result. `saved` must be a
+    // contiguous F32 tensor with exactly the packed tensor's element count.
+    // Used by the trainer's per-layer backward recompute, which otherwise
+    // re-runs the whole attention forward once per layer.
+    GGML_API void                  ggml_flash_attn_train_set_saved(struct ggml_tensor * packed, struct ggml_tensor * saved);
+    GGML_API struct ggml_tensor *  ggml_flash_attn_train_get_saved(const struct ggml_tensor * packed);
+
     // Shared packing arithmetic -- the constructor, both view helpers and every
     // backend impl go through these. Exported so the parity tool can too.
     GGML_API size_t  ggml_flash_attn_train_lse_offset(const struct ggml_tensor * q);

@@ -49,6 +49,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_repeat_back       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_unary             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_glu               (ggml_metal_op_t ctx, int idx);
@@ -80,6 +81,22 @@ int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_rms_norm_back     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_convrot8          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_convrot8_back     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_out_prod           (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flash_attn_train      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flash_attn_train_back (ggml_metal_op_t ctx, int idx);
+
+// HOT-Step: FLASH_ATTN_TRAIN_BACK's own extra scratch region for the
+// precomputed delta[] buffer (kernel_flash_attn_train_delta_f32's output,
+// read back by both the dQ and dK/dV backward passes) -- same mechanism as
+// ggml_metal_op_flash_attn_ext_extra_tmp/_extra_pad, queried by
+// ggml_backend_metal_buffer_type_get_alloc_size (ggml-metal.cpp) so the op's
+// own destination-tensor buffer reserves the extra bytes at allocation time.
+size_t ggml_metal_op_flash_attn_train_back_extra_delta(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_train_back_extra_dsw  (const struct ggml_tensor * op);
+size_t ggml_metal_op_convrot8_extra(const struct ggml_tensor * op);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);
@@ -104,6 +121,9 @@ int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_count_equal       (ggml_metal_op_t ctx, int idx);
+
+// debug (GGML_METAL_CR8B_CHECK=1): print the accumulated convrot8 backward comparison, called from ggml_metal_free
+void ggml_metal_op_convrot8_check_report(void);
 
 #ifdef __cplusplus
 }

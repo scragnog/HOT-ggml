@@ -10708,6 +10708,193 @@ static void ggml_compute_forward_bf16_round(const ggml_compute_params * params, 
     }
 }
 
+// HOT-Step patch: yue2-convrot8-cpu
+//
+// CPU port of HOT-Step's ConvRot8 quantized linear (previously CUDA-only,
+// see ggml-cuda/convrot8.cu -- GGML_OP_CONVROT8{,_BACK} used to GGML_ABORT
+// here). Numerics are written to match this project's own validated scalar
+// oracle, tools/yue2-aitk-reference/convrot_cpu.h (aitk_reference::convrot8),
+// which test_convrot_ggml_contract.cpp checks against the CUDA kernel --
+// matching that oracle bit-for-bit is what makes this port trustworthy
+// without a CUDA machine to compare against directly. Scalar and
+// unoptimized (no SIMD/BLAS): the point is that YuE2 Joint Training's
+// frozen-weight forward/backward can now run end to end on a non-CUDA
+// backend at all, which it could not before this patch.
+
+static inline int hs_convrot8_round_half_even(float x) {
+    const float lo = floorf(x);
+    const float frac = x - lo;
+    int result = (int) lo;
+    if (frac > 0.5f || (frac == 0.5f && (result & 1) != 0)) {
+        ++result;
+    }
+    return result;
+}
+
+// Self-inverse regular Hadamard rotation (Kronecker powers of the 4x4 block
+// below), power-of-4 group sizes only. Bit-for-bit the same construction as
+// engine/src/convrot.h's convrot_transform_group -- kept as an independent
+// copy here because engine/ggml carries no dependency on the outer
+// project's src/; see engine/patches/README.md for why ggml stays a
+// pristine submodule plus these patches and nothing else.
+static void hs_convrot8_hadamard_group(float * v, int64_t g) {
+    for (int64_t stride = 1; stride < g; stride *= 4) {
+        const int64_t block = stride * 4;
+        for (int64_t base = 0; base < g; base += block) {
+            for (int64_t off = 0; off < stride; ++off) {
+                float * p = v + base + off;
+                const float x0 = p[0], x1 = p[stride], x2 = p[2 * stride], x3 = p[3 * stride];
+                p[0]          =  x0 + x1 + x2 - x3;
+                p[stride]     =  x0 + x1 - x2 + x3;
+                p[2 * stride] =  x0 - x1 + x2 + x3;
+                p[3 * stride] = -x0 + x1 + x2 + x3;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf((float) g);
+    for (int64_t i = 0; i < g; ++i) {
+        v[i] *= norm;
+    }
+}
+
+static void hs_convrot8_hadamard_row(float * row, int64_t cols, int64_t g) {
+    for (int64_t c = 0; c < cols; c += g) {
+        hs_convrot8_hadamard_group(row + c, g);
+    }
+}
+
+void ggml_compute_forward_convrot8(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * weight_i8  = dst->src[0];
+    const ggml_tensor * x_f32      = dst->src[1];
+    const ggml_tensor * scales_f32 = dst->src[2];
+    const ggml_tensor * bias_f32   = dst->src[3];
+
+    GGML_ASSERT(weight_i8->type == GGML_TYPE_I8 && x_f32->type == GGML_TYPE_F32 &&
+                scales_f32->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight_i8) && ggml_is_contiguous(x_f32) &&
+                ggml_is_contiguous(scales_f32) && ggml_is_contiguous(dst));
+    GGML_ASSERT(!bias_f32 || (bias_f32->type == GGML_TYPE_F32 && ggml_is_contiguous(bias_f32)));
+
+    const int64_t in   = x_f32->ne[0];
+    const int64_t rows = x_f32->ne[1];
+    const int64_t out  = weight_i8->ne[1];
+
+    int32_t op_params[2];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+    const int64_t rotation = op_params[0];
+    const bool    use_bf16 = op_params[1] != 0;
+
+    const int8_t * weight = (const int8_t *) weight_i8->data;
+    const float  * scales = (const float *) scales_f32->data;
+    const float  * bias   = bias_f32 ? (const float *) bias_f32->data : nullptr;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const auto cast = [use_bf16](float x) { return use_bf16 ? GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x)) : x; };
+
+    // Per-thread scratch: a rotated/cast activation row plus its int8 codes.
+    // The 2x-floats budget matches the planner's estimate added for this op
+    // in ggml-cpu.c (deliberately generous, same style as this file's other
+    // "overestimated" scratch comments) -- the two must change together.
+    const size_t per_thread = (size_t) (2 * in) + CACHE_LINE_SIZE_F32;
+    float  * rotated = (float *) params->wdata + per_thread * ith;
+    int8_t * codes   = (int8_t *) (rotated + in);
+
+    for (int64_t m = ith; m < rows; m += nth) {
+        const float * src_row = (const float *) ((const char *) x_f32->data + m * x_f32->nb[1]);
+        for (int64_t k = 0; k < in; ++k) {
+            rotated[k] = cast(src_row[k]);
+        }
+        if (rotation != 1) {
+            hs_convrot8_hadamard_row(rotated, in, rotation);
+        }
+        for (int64_t k = 0; k < in; ++k) {
+            rotated[k] = cast(rotated[k]); // unconditional 2nd cast -- matches the oracle even when rotation==1
+        }
+        float amax = 0.0f;
+        for (int64_t k = 0; k < in; ++k) {
+            const float av = rotated[k] < 0.0f ? -rotated[k] : rotated[k];
+            if (av > amax) amax = av;
+        }
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+        for (int64_t k = 0; k < in; ++k) {
+            int q = hs_convrot8_round_half_even(rotated[k] / scale);
+            if (q > 127) q = 127; else if (q < -127) q = -127;
+            codes[k] = (int8_t) q;
+        }
+        float * dst_row = (float *) ((char *) dst->data + m * dst->nb[1]);
+        for (int64_t n = 0; n < out; ++n) {
+            int32_t sum = 0;
+            const int8_t * wrow = weight + n * in;
+            for (int64_t k = 0; k < in; ++k) {
+                sum += (int32_t) codes[k] * (int32_t) wrow[k];
+            }
+            // Triton CUDA epilogue order: integer accumulator * (activation scale * weight scale).
+            const float y = (float) sum * (scale * scales[n]);
+            dst_row[n] = bias ? cast(y + cast(bias[n])) : cast(y);
+        }
+    }
+}
+
+void ggml_compute_forward_convrot8_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    // Only the activation receives a backward gradient (weight/scales are
+    // frozen), so this only needs the frozen weight+scales and the upstream
+    // gradient -- see ggml_convrot8_back()'s src wiring in ggml.c.
+    const ggml_tensor * weight_i8  = dst->src[0];
+    const ggml_tensor * dy_f32     = dst->src[1];
+    const ggml_tensor * scales_f32 = dst->src[2];
+
+    GGML_ASSERT(weight_i8->type == GGML_TYPE_I8 && dy_f32->type == GGML_TYPE_F32 &&
+                scales_f32->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight_i8) && ggml_is_contiguous(dy_f32) &&
+                ggml_is_contiguous(scales_f32) && ggml_is_contiguous(dst));
+
+    const int64_t in   = weight_i8->ne[0];
+    const int64_t out  = weight_i8->ne[1];
+    const int64_t rows = dy_f32->ne[1];
+    GGML_ASSERT(dst->ne[0] == in && dst->ne[1] == rows && dy_f32->ne[0] == out);
+
+    int32_t op_params[2];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+    const int64_t rotation = op_params[0];
+    const bool    use_bf16 = op_params[1] != 0;
+
+    const int8_t * weight = (const int8_t *) weight_i8->data;
+    const float  * scales = (const float *) scales_f32->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const auto cast = [use_bf16](float x) { return use_bf16 ? GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x)) : x; };
+
+    // Per-thread scratch matches the planner's estimate for this op in
+    // ggml-cpu.c -- the two must change together.
+    const size_t per_thread = (size_t) in + CACHE_LINE_SIZE_F32;
+    float * grad_row_buf = (float *) params->wdata + per_thread * ith;
+
+    for (int64_t m = ith; m < rows; m += nth) {
+        const float * grad_row = (const float *) ((const char *) dy_f32->data + m * dy_f32->nb[1]);
+        for (int64_t k = 0; k < in; ++k) {
+            float sum = 0.0f;
+            for (int64_t n = 0; n < out; ++n) {
+                const float w = cast((float) weight[n * in + k] * cast(scales[n]));
+                sum += cast(grad_row[n]) * w;
+            }
+            grad_row_buf[k] = cast(sum);
+        }
+        if (rotation != 1) {
+            hs_convrot8_hadamard_row(grad_row_buf, in, rotation);
+        }
+        float * dst_row = (float *) ((char *) dst->data + m * dst->nb[1]);
+        for (int64_t k = 0; k < in; ++k) {
+            dst_row[k] = cast(grad_row_buf[k]); // unconditional final cast -- matches the oracle
+        }
+    }
+}
+
 //ggml_compute_forward_unary
 
 void ggml_compute_forward_unary(

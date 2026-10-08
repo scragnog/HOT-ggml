@@ -2050,9 +2050,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_train_back(params, tensor);
             } break;
+        // HOT-Step patch: yue2-convrot8-cpu
         case GGML_OP_CONVROT8:
+            {
+                ggml_compute_forward_convrot8(params, tensor);
+            } break;
         case GGML_OP_CONVROT8_BACK:
-            GGML_ABORT("ConvRot8 is CUDA-only; select a CUDA backend");
+            {
+                ggml_compute_forward_convrot8_back(params, tensor);
+            } break;
         case GGML_OP_SSM_CONV:
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
@@ -2447,6 +2453,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         // HOT-Step patch: flash-attn-train
         case GGML_OP_FLASH_ATTN_TRAIN:
         case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+        // HOT-Step patch: yue2-convrot8-cpu
+        case GGML_OP_CONVROT8:
+        case GGML_OP_CONVROT8_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
@@ -3061,6 +3070,25 @@ struct ggml_cplan ggml_graph_plan(
                                                       + MAX(GGML_FA_TRAIN_BQ*D, 2*GGML_FA_TRAIN_BK*D)
                                                       + GGML_FA_TRAIN_BQ
                                                       + CACHE_LINE_SIZE_F32);
+                    } break;
+
+                // HOT-Step patch: yue2-convrot8-cpu
+                case GGML_OP_CONVROT8:
+                    {
+                        // per thread: rotated/cast activation row [in floats] +
+                        // its int8 codes -- 2x floats is a generous, cheap
+                        // overestimate (matches ggml_compute_forward_convrot8's
+                        // own per_thread constant; the two must move together).
+                        const int64_t in = node->src[1]->ne[0];
+                        cur += sizeof(float)*n_tasks*(2*in + CACHE_LINE_SIZE_F32);
+                    } break;
+                case GGML_OP_CONVROT8_BACK:
+                    {
+                        // per thread: one accumulated+cast input-gradient row
+                        // (matches ggml_compute_forward_convrot8_back's own
+                        // per_thread constant; the two must move together).
+                        const int64_t in = node->src[0]->ne[0];
+                        cur += sizeof(float)*n_tasks*(in + CACHE_LINE_SIZE_F32);
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

@@ -1,10 +1,15 @@
 #include "common.h"
 
 // OP: 0 - add, 1 - sub, 2 - mul, 3 - div
-constant short FC_bin_op [[function_constant(FC_BIN + 0)]];
-constant short FC_bin_f  [[function_constant(FC_BIN + 1)]];
-constant bool  FC_bin_rb [[function_constant(FC_BIN + 2)]];
-constant bool  FC_bin_cb [[function_constant(FC_BIN + 3)]];
+constant short FC_bin_op  [[function_constant(FC_BIN + 0)]];
+constant short FC_bin_f   [[function_constant(FC_BIN + 1)]];
+constant bool  FC_bin_rb  [[function_constant(FC_BIN + 2)]];
+constant bool  FC_bin_cb  [[function_constant(FC_BIN + 3)]];
+// HOT-Step: BF16_ROUND epilogue fusion. True when the immediately-following graph node is a
+// single-consumer ggml_bf16_round(this_op) (checked host-side in ggml_metal_op_bin): writes
+// bf16_round_cast(result) directly instead of materializing the un-rounded intermediate and
+// dispatching a separate unary pass over it. Only ever set for the F32 instantiation.
+constant bool  FC_bin_rnd [[function_constant(FC_BIN + 4)]];
 
 template <typename T0, typename T1, typename T>
 kernel void kernel_bin_fuse_impl(
@@ -15,10 +20,11 @@ kernel void kernel_bin_fuse_impl(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-#define FC_OP FC_bin_op
-#define FC_F  FC_bin_f
-#define FC_RB FC_bin_rb
-#define FC_CB FC_bin_cb
+#define FC_OP  FC_bin_op
+#define FC_F   FC_bin_f
+#define FC_RB  FC_bin_rb
+#define FC_CB  FC_bin_cb
+#define FC_RND FC_bin_rnd
 
     if (FC_RB) {
         // row broadcast
@@ -31,21 +37,25 @@ kernel void kernel_bin_fuse_impl(
         if (FC_F == 1) {
             device const T1 * src1_row = (device const T1 *) (src1 + args.o1[0]);
 
+            T res = T(0);
+
             if (FC_OP == 0) {
-                dst_row[i0] = src0_row[i0] + src1_row[i1];
+                res = src0_row[i0] + src1_row[i1];
             }
 
             if (FC_OP == 1) {
-                dst_row[i0] = src0_row[i0] - src1_row[i1];
+                res = src0_row[i0] - src1_row[i1];
             }
 
             if (FC_OP == 2) {
-                dst_row[i0] = src0_row[i0] * src1_row[i1];
+                res = src0_row[i0] * src1_row[i1];
             }
 
             if (FC_OP == 3) {
-                dst_row[i0] = src0_row[i0] / src1_row[i1];
+                res = src0_row[i0] / src1_row[i1];
             }
+
+            dst_row[i0] = FC_RND ? bf16_round_cast<T>(res) : res;
         } else {
             T0 res = src0_row[i0];
 
@@ -73,7 +83,7 @@ kernel void kernel_bin_fuse_impl(
                 }
             }
 
-            dst_row[i0] = res;
+            dst_row[i0] = FC_RND ? bf16_round_cast<T>(res) : res;
         }
     } else {
         const int i03 = tgpig.z;
@@ -97,21 +107,25 @@ kernel void kernel_bin_fuse_impl(
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
 
+                T res = T(0);
+
                 if (FC_OP == 0) {
-                    dst_ptr[i0] = src0_ptr[i0] + src1_ptr[i10];
+                    res = src0_ptr[i0] + src1_ptr[i10];
                 }
 
                 if (FC_OP == 1) {
-                    dst_ptr[i0] = src0_ptr[i0] - src1_ptr[i10];
+                    res = src0_ptr[i0] - src1_ptr[i10];
                 }
 
                 if (FC_OP == 2) {
-                    dst_ptr[i0] = src0_ptr[i0] * src1_ptr[i10];
+                    res = src0_ptr[i0] * src1_ptr[i10];
                 }
 
                 if (FC_OP == 3) {
-                    dst_ptr[i0] = src0_ptr[i0] / src1_ptr[i10];
+                    res = src0_ptr[i0] / src1_ptr[i10];
                 }
+
+                dst_ptr[i0] = FC_RND ? bf16_round_cast<T>(res) : res;
             }
         } else {
             device const T1 * src1_ptr[8];
@@ -148,7 +162,7 @@ kernel void kernel_bin_fuse_impl(
                     }
                 }
 
-                dst_ptr[i0] = res;
+                dst_ptr[i0] = FC_RND ? bf16_round_cast<T>(res) : res;
             }
         }
     }
@@ -157,6 +171,7 @@ kernel void kernel_bin_fuse_impl(
 #undef FC_F
 #undef FC_RB
 #undef FC_CB
+#undef FC_RND
 }
 
 typedef decltype(kernel_bin_fuse_impl<float, float, float>) kernel_bin_fuse_t;
