@@ -490,6 +490,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_FLASH_ATTN_TRAIN:
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            // S2c: ggml.c's constructors now also accept BF16 Q/K/V (same
+            // type across all three), but this CPU kernel is still F32-only
+            // -- ops.cpp's GGML_ASSERT at the top of both compute functions
+            // aborts on anything else. Refuse BF16 explicitly so the
+            // scheduler never falls back here instead of to CUDA/Vulkan.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32;
         default:
             return true;
     }
