@@ -7973,8 +7973,11 @@ void ggml_build_backward_expand(
             // tensor-core GEMMs (BF16 x BF16, FP32 accumulate); MUL_MAT's
             // backward writes that operand's gradient in F32 (OUT_PROD) and
             // the cast's CPY backward hands it to the F32 parameter unchanged.
+            // S2c: likewise BF16 Q/K/V of FLASH_ATTN_TRAIN, whose backward
+            // returns F32 dQ/dK/dV views.
             GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
-                        (node->src[j]->type == GGML_TYPE_BF16 && node->op == GGML_OP_MUL_MAT && j == 0));
+                        (node->src[j]->type == GGML_TYPE_BF16 && node->op == GGML_OP_MUL_MAT && j == 0) ||
+                        (node->src[j]->type == GGML_TYPE_BF16 && node->op == GGML_OP_FLASH_ATTN_TRAIN && j <= 2));
             node_needs_grad = true;
             break;
         }

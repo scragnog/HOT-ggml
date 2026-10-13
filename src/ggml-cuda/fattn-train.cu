@@ -80,6 +80,7 @@ static void fa_train_trace(
 enum fa_train_prec_mode {
     FA_TRAIN_PREC_F32  = 0,   // v1 scalar kernels
     FA_TRAIN_PREC_TF32 = 1,   // tensor-core kernels
+    FA_TRAIN_PREC_BF16 = 2,   // BF16 Q/K/V, m16n8k16 tensor-core kernels (S2c)
 };
 
 struct fa_train_prec_resolved {
@@ -99,8 +100,38 @@ static bool fa_train_view_8aligned(const ggml_tensor * t) {
            t->nb[1] % 8 == 0 && t->nb[2] % 8 == 0 && t->nb[3] % 8 == 0;
 }
 
+// S2c: BF16 Q/K/V storage has exactly one kernel family, so there is no
+// fallback to resolve to. Every condition here is also checked by
+// ggml_cuda_flash_attn_train_supported (with the device cc), and the launch
+// aborts on "none" rather than hand 2-byte storage to an f32 kernel.
+static bool fa_train_is_bf16(const ggml_tensor * op) {
+    return op->src[0]->type == GGML_TYPE_BF16;
+}
+
+static bool fa_train_view_4aligned(const ggml_tensor * t) {
+    return ((uintptr_t) t->data) % 4 == 0 &&
+           t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0 && t->nb[3] % 4 == 0;
+}
+
 static fa_train_prec_resolved fa_train_resolve_prec(const ggml_tensor * op, const int cc, const bool back) {
     fa_train_prec_resolved r = { FA_TRAIN_PREC_F32, "f32" };
+
+    if (fa_train_is_bf16(op)) {
+        if (!fa_train_view_4aligned(op->src[0]) || !fa_train_view_4aligned(op->src[1]) ||
+            !fa_train_view_4aligned(op->src[2])) {
+            r.label = "none (unaligned bf16 view)";
+            return r;
+        }
+        // The backward stages dO (src[5], f32) with 8-byte loads.
+        if (back && (!op->src[5] || !fa_train_view_8aligned(op->src[5]))) {
+            r.label = "none (unaligned dO)";
+            return r;
+        }
+        r.mode  = FA_TRAIN_PREC_BF16;
+        r.label = "bf16";
+        GGML_UNUSED_VARS(cc);
+        return r;
+    }
 
     if ((enum ggml_prec) ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
         r.label = "f32 (requested)";
@@ -805,7 +836,378 @@ fa_train_fwd_tf32(
 #endif // AMPERE_MMA_AVAILABLE
 }
 
-bool ggml_cuda_flash_attn_train_supported(const ggml_tensor * op) {
+
+// ─── BF16 forward (S2c) ─────────────────────────────────────────────────────
+//
+// RESEARCH/YUE2_S2C_DESIGN.md. The TF32 forward's contract -- packed O | LSE,
+// the -INF rule, the fully-masked-row rule, out-of-range as a first-class
+// term, bitwise determinism -- on BF16 Q/K/V storage with
+// mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32. Only the operands are
+// BF16: scores, the running max and sum, LSE and the O accumulator are the
+// instruction's own f32, and P is rounded to BF16 once, as the PV operand,
+// with the row sum taken over the unrounded p (as the TF32 kernel does).
+//
+// Fragment maps, MEASURED with a standalone probe against a scalar product
+// (max abs err 0.0; .scratch/s2c-probe/bf16_map_probe.cu), g = lane/4,
+// t = lane%4, each register two BF16 with the lower index in the low half:
+//
+//   A   16x16, 4 regs   r -> row g + 8*(r%2), cols 2t + 8*(r/2) + {0,1}
+//   B   16x8 (K x N)    r -> k 2t + 8*r + {0,1}, n g
+//   C/D 16x8 f32        l -> row g + 8*(l/2), col 2t + l%2   (the TF32 C map)
+//
+// Unlike TF32, two adjacent n8 C tiles ARE one k16 A fragment, register for
+// register after packing: the score tile feeds PV with no shuffle (probed).
+// The PV B operand (k = key, n = d) comes from the row-major V tile through
+// ldmatrix.x2.trans, which the same probe checked against the B map.
+//
+// Shared tiles are [BK][D + 8] BF16: the 16-byte pad puts the 8 rows of each
+// ldmatrix phase, and the 8 key rows of the QK B read (word 68g + 8ks + t +
+// 4r, bank 4g + t + ...), on distinct banks.
+
+#define FA_TRAIN_BF16_NW 4                       // warps per block
+#define FA_TRAIN_BF16_BQ (FA_TRAIN_BF16_NW*16)   // queries per block
+#define FA_TRAIN_BF16_BK 64                      // keys per tile = four PV k-slices
+
+namespace fa_bf16 {
+    static __device__ __forceinline__ uint32_t pack(const float lo, const float hi) {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+        return *(const uint32_t *) &v;
+    }
+
+    // D[16x8] += A[16x16] @ B[16x8]. BF16 multiply, f32 accumulate.
+    static __device__ __forceinline__ void mma_m16n8k16(
+            float (&D)[4], const uint32_t (&A)[4], const uint32_t (&B)[2]) {
+#ifdef AMPERE_MMA_AVAILABLE
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+f"(D[0]), "+f"(D[1]), "+f"(D[2]), "+f"(D[3])
+            : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]));
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+    }
+
+    // The B fragment of a k16 x n8 slice of a row-major [k][n] shared tile:
+    // lanes 0-15 address rows 0-15 of the slice at its first column.
+    static __device__ __forceinline__ void ldmatrix_b_trans(uint32_t (&B)[2], const void * row) {
+#ifdef AMPERE_MMA_AVAILABLE
+        const unsigned addr = (unsigned) __cvta_generic_to_shared(row);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+                     : "=r"(B[0]), "=r"(B[1]) : "r"(addr));
+#else
+        GGML_UNUSED_VARS(B, row);
+        NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+    }
+}
+
+template <int D>
+static __global__ void __launch_bounds__(FA_TRAIN_BF16_NW*WARP_SIZE, 1)
+fa_train_fwd_bf16(
+        const char * __restrict__ q_base,
+        const char * __restrict__ k_base,
+        const char * __restrict__ v_base,
+        const half * __restrict__ mask,
+        float      * __restrict__ o_data,
+        float      * __restrict__ lse_data,
+        const int64_t q_nb1, const int64_t q_nb2, const int64_t q_nb3,
+        const int64_t k_nb1, const int64_t k_nb2, const int64_t k_nb3,
+        const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3,
+        const int64_t mne0, const int64_t mne1, const int64_t mne2, const int64_t mne3,
+        const int64_t S, const int64_t S_kv, const int64_t Nh, const int64_t G,
+        const float scale) {
+#ifdef AMPERE_MMA_AVAILABLE
+    constexpr int NW  = FA_TRAIN_BF16_NW;
+    constexpr int BK  = FA_TRAIN_BF16_BK;
+    constexpr int NT  = NW*WARP_SIZE;
+    constexpr int NKS = D/16;     // k16 slices of the QK^T reduction
+    constexpr int NDB = D/8;      // 8-wide d-blocks of the O accumulator
+    constexpr int NNB = BK/8;     // 8-wide key blocks of the score tile
+    constexpr int DP  = D + 8;    // padded shared row, in BF16
+    constexpr int WPR = D/2;      // 4-byte words per K/V row
+
+    static_assert(BK % 16 == 0 && NNB <= 8, "P is whole k16 A fragments; dead bits fit a uint32");
+    static_assert(NT % WPR == 0 && BK % (NT/WPR) == 0, "the staging loop assumes whole rows per pass");
+
+    __shared__ __align__(16) __nv_bfloat16 Ksh[BK*DP];
+    __shared__ __align__(16) __nv_bfloat16 Vsh[BK*DP];
+
+    const int lane = threadIdx.x;
+    const int w    = threadIdx.y;
+    const int tid  = w*WARP_SIZE + lane;
+    const int g    = lane/4;
+    const int t    = lane%4;
+
+    const int64_t q0 = (int64_t) blockIdx.x*FA_TRAIN_BF16_BQ + w*16;
+    const int64_t h  = blockIdx.y;
+    const int64_t b  = blockIdx.z;
+    const int64_t hk = h/G;
+
+    // Suffix _a is this lane's row g (fragment elements l = 0, 1), _c row g+8.
+    const int64_t ia  = q0     + g;
+    const int64_t ic  = q0 + 8 + g;
+    const bool    oka = ia < S;
+    const bool    okc = ic < S;
+
+    // Q -> A fragments, once per block: register r of slice ks is the BF16 pair
+    // (row g + 8*(r%2), d = 16*ks + 2t + 8*(r/2) + {0,1}). One 4-byte load per
+    // pair; the resolver requires 4-byte aligned views. Rows past S are zero.
+    uint32_t qa[NKS][4];
+    {
+        const uint32_t * qra = (const uint32_t *) (q_base + (oka ? ia : 0)*q_nb1 + h*q_nb2 + b*q_nb3);
+        const uint32_t * qrc = (const uint32_t *) (q_base + (okc ? ic : 0)*q_nb1 + h*q_nb2 + b*q_nb3);
+#pragma unroll
+        for (int ks = 0; ks < NKS; ++ks) {
+            const int w0 = 8*ks + t;      // word of d = 16ks + 2t
+            const int w1 = w0 + 4;        // word of d = 16ks + 2t + 8
+            qa[ks][0] = oka ? qra[w0] : 0u;
+            qa[ks][1] = okc ? qrc[w0] : 0u;
+            qa[ks][2] = oka ? qra[w1] : 0u;
+            qa[ks][3] = okc ? qrc[w1] : 0u;
+        }
+    }
+
+    const half * mrow_a = nullptr;
+    const half * mrow_c = nullptr;
+    if (mask) {
+        const int64_t mhb = mne0*mne1*((h % mne2) + mne2*(b % mne3));
+        mrow_a = mask + mhb + mne0*(oka ? ia : 0);
+        mrow_c = mask + mhb + mne0*(okc ? ic : 0);
+    }
+
+    const char * kp0 = k_base + hk*k_nb2 + b*k_nb3;
+    const char * vp0 = v_base + hk*v_nb2 + b*v_nb3;
+
+    float oacc[NDB][4];
+#pragma unroll
+    for (int db = 0; db < NDB; ++db) {
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            oacc[db][l] = 0.0f;
+        }
+    }
+    float mrun_a = -INFINITY, mrun_c = -INFINITY;
+    float lrun_a = 0.0f,      lrun_c = 0.0f;
+
+    for (int64_t j0 = 0; j0 < S_kv; j0 += BK) {
+        const int    nk   = (int) min((int64_t) BK, S_kv - j0);
+        const half * ma_t = mrow_a ? mrow_a + j0 : nullptr;
+        const half * mc_t = mrow_c ? mrow_c + j0 : nullptr;
+
+        // Tile liveness, then ONE barrier that both publishes it and fences the
+        // previous tile's K/V reads (the TF32 kernel's merged barrier).
+        bool anylive = false;
+#pragma unroll
+        for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int col = 8*nb + 2*t + e;
+                if (col < nk) {
+                    anylive = anylive ||
+                              (oka && (!ma_t || __half2float(ma_t[col]) != -INFINITY)) ||
+                              (okc && (!mc_t || __half2float(mc_t[col]) != -INFINITY));
+                }
+            }
+        }
+        if (!__syncthreads_or(anylive)) {
+            continue;
+        }
+
+        // Stage K and V row-major, one 4-byte BF16 pair per thread per row;
+        // rows past S_kv are zero.
+        {
+            const int jj0 = tid/WPR;
+            const int wd  = tid%WPR;
+#pragma unroll
+            for (int jj = jj0; jj < BK; jj += NT/WPR) {
+                uint32_t kw = 0u;
+                uint32_t vw = 0u;
+                if (jj < nk) {
+                    kw = ((const uint32_t *) (kp0 + (j0 + jj)*k_nb1))[wd];
+                    vw = ((const uint32_t *) (vp0 + (j0 + jj)*v_nb1))[wd];
+                }
+                *(uint32_t *) (Ksh + jj*DP + 2*wd) = kw;
+                *(uint32_t *) (Vsh + jj*DP + 2*wd) = vw;
+            }
+        }
+        __syncthreads();
+
+        // S = Q @ K^T: B is (k = d, n = key), register r the adjacent d pair
+        // 16ks + 2t + 8r of key row g of the n-block.
+        float sacc[NNB][4];
+#pragma unroll
+        for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                sacc[nb][l] = 0.0f;
+            }
+            const __nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
+#pragma unroll
+            for (int ks = 0; ks < NKS; ++ks) {
+                uint32_t kb[2];
+                kb[0] = *(const uint32_t *) (krow + 16*ks);
+                kb[1] = *(const uint32_t *) (krow + 16*ks + 8);
+                fa_bf16::mma_m16n8k16(sacc[nb], qa[ks], kb);
+            }
+        }
+
+        // Scores, row max, P and row sum: the TF32 kernel's code, same C map.
+        unsigned int dead   = 0;
+        float        lmax_a = -INFINITY;
+        float        lmax_c = -INFINITY;
+#pragma unroll
+        for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int    col = 8*nb + 2*t + (l%2);
+                const half * mr  = (l < 2) ? ma_t : mc_t;
+                const bool   ok  = (l < 2) ? oka : okc;
+                float mv = -INFINITY;
+                if (ok && col < nk) {
+                    mv = mr ? __half2float(mr[col]) : 0.0f;
+                }
+                const float s = fa_tf32::score(sacc[nb][l], scale, mv);
+                sacc[nb][l]   = s;
+                if (mv == -INFINITY) {
+                    dead |= 1u << (4*nb + l);
+                }
+                if (l < 2) {
+                    lmax_a = fmaxf(lmax_a, s);
+                } else {
+                    lmax_c = fmaxf(lmax_c, s);
+                }
+            }
+        }
+        lmax_a = fmaxf(lmax_a, __shfl_xor_sync(0xffffffff, lmax_a, 1));
+        lmax_a = fmaxf(lmax_a, __shfl_xor_sync(0xffffffff, lmax_a, 2));
+        lmax_c = fmaxf(lmax_c, __shfl_xor_sync(0xffffffff, lmax_c, 1));
+        lmax_c = fmaxf(lmax_c, __shfl_xor_sync(0xffffffff, lmax_c, 2));
+
+        const float mnew_a = fmaxf(mrun_a, lmax_a);
+        const float mnew_c = fmaxf(mrun_c, lmax_c);
+        const float corr_a = (mnew_a == -INFINITY) ? 1.0f
+                           : ((mrun_a == -INFINITY) ? 0.0f : __expf(mrun_a - mnew_a));
+        const float corr_c = (mnew_c == -INFINITY) ? 1.0f
+                           : ((mrun_c == -INFINITY) ? 0.0f : __expf(mrun_c - mnew_c));
+
+        float psum_a = 0.0f;
+        float psum_c = 0.0f;
+#pragma unroll
+        for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const float mn = (l < 2) ? mnew_a : mnew_c;
+                const float p  = ((dead >> (4*nb + l)) & 1u) ? 0.0f : __expf(sacc[nb][l] - mn);
+                sacc[nb][l]    = p;
+                if (l < 2) {
+                    psum_a += p;
+                } else {
+                    psum_c += p;
+                }
+            }
+        }
+        psum_a += __shfl_xor_sync(0xffffffff, psum_a, 1);
+        psum_a += __shfl_xor_sync(0xffffffff, psum_a, 2);
+        psum_c += __shfl_xor_sync(0xffffffff, psum_c, 1);
+        psum_c += __shfl_xor_sync(0xffffffff, psum_c, 2);
+
+        lrun_a = lrun_a*corr_a + psum_a;
+        lrun_c = lrun_c*corr_c + psum_c;
+
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            oacc[db][0] *= corr_a;
+            oacc[db][1] *= corr_a;
+            oacc[db][2] *= corr_c;
+            oacc[db][3] *= corr_c;
+        }
+
+        // O += P @ V, one k16 slice of keys at a time. Slice kk's two C tiles
+        // (n-blocks 2kk, 2kk+1) are one A fragment; V's B fragment for d-block
+        // db is ldmatrix.trans over the slice's 16 key rows at column 8*db.
+#pragma unroll
+        for (int kk = 0; kk < NNB/2; ++kk) {
+            uint32_t pa[4];
+            pa[0] = fa_bf16::pack(sacc[2*kk    ][0], sacc[2*kk    ][1]);
+            pa[1] = fa_bf16::pack(sacc[2*kk    ][2], sacc[2*kk    ][3]);
+            pa[2] = fa_bf16::pack(sacc[2*kk + 1][0], sacc[2*kk + 1][1]);
+            pa[3] = fa_bf16::pack(sacc[2*kk + 1][2], sacc[2*kk + 1][3]);
+            const __nv_bfloat16 * vrow = Vsh + (16*kk + lane%16)*DP;
+#pragma unroll
+            for (int db = 0; db < NDB; ++db) {
+                uint32_t vb[2];
+                fa_bf16::ldmatrix_b_trans(vb, vrow + 8*db);
+                fa_bf16::mma_m16n8k16(oacc[db], pa, vb);
+            }
+        }
+
+        mrun_a = mnew_a;
+        mrun_c = mnew_c;
+    }
+
+    // Packed O | LSE, the TF32 kernel's store (same C map).
+    const int dj = 2*t;
+    if (oka) {
+        float * orow = o_data + D*(h + Nh*(ia + S*b));
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            orow[8*db + dj    ] = lrun_a > 0.0f ? oacc[db][0]/lrun_a : 0.0f;
+            orow[8*db + dj + 1] = lrun_a > 0.0f ? oacc[db][1]/lrun_a : 0.0f;
+        }
+        if (t == 0) {
+            lse_data[h + Nh*(ia + S*b)] = (lrun_a > 0.0f) ? (mrun_a + __logf(lrun_a)) : 0.0f;
+        }
+    }
+    if (okc) {
+        float * orow = o_data + D*(h + Nh*(ic + S*b));
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            orow[8*db + dj    ] = lrun_c > 0.0f ? oacc[db][2]/lrun_c : 0.0f;
+            orow[8*db + dj + 1] = lrun_c > 0.0f ? oacc[db][3]/lrun_c : 0.0f;
+        }
+        if (t == 0) {
+            lse_data[h + Nh*(ic + S*b)] = (lrun_c > 0.0f) ? (mrun_c + __logf(lrun_c)) : 0.0f;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(q_base, k_base, v_base, mask, o_data, lse_data,
+                     q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3,
+                     mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+// BF16 operands are accepted only where the BF16 kernels resolve: all three
+// BF16 with 4-byte aligned strides, D = 128, an explicit GGML_PREC_BF16
+// request, and an NVIDIA device of cc >= 800 whose code this build carries.
+// Anything else is refused here, so the scheduler sees no support at all
+// rather than a silent fallback (the CPU and Vulkan backends refuse BF16 too).
+static bool fa_train_bf16_supported(const ggml_tensor * op, const int cc) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    if (q->type != GGML_TYPE_BF16 || k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    if (q->nb[0] != 2 || k->nb[0] != 2 || v->nb[0] != 2) {
+        return false;
+    }
+    for (const ggml_tensor * x : { q, k, v }) {
+        if (x->nb[1] % 4 != 0 || x->nb[2] % 4 != 0 || x->nb[3] % 4 != 0) {
+            return false;
+        }
+    }
+    if ((enum ggml_prec) ggml_get_op_params_i32(op, 3) != GGML_PREC_BF16) {
+        return false;
+    }
+    if (q->ne[0] != 128) {
+        return false;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+           ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE;
+}
+
+bool ggml_cuda_flash_attn_train_supported(const ggml_tensor * op, const int cc) {
     if (op->type != GGML_TYPE_F32) {
         return false;
     }
@@ -818,21 +1220,20 @@ bool ggml_cuda_flash_attn_train_supported(const ggml_tensor * op) {
     if (!q || !k || !v) {
         return false;
     }
-    // S2c: ggml.c's constructor now also accepts BF16 Q/K/V (same type, all
-    // three), but no BF16 MMA kernel exists in this file yet -- the m16n8k16
-    // fragment map differs from the TF32 kernels' m16n8k8 and still needs to
-    // be derived (RESEARCH/YUE2_S2C_DESIGN.md). Refuse every BF16 operand
-    // here explicitly, rather than let supports_op say yes and dispatch into
-    // a kernel that would read 2-byte BF16 storage as 4-byte float. Flip
-    // this once the BF16 fwd/bwd kernels below actually exist.
     if (q->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_BF16 || v->type == GGML_TYPE_BF16) {
-        return false;
-    }
-    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float)) {
-        return false;
+        if (!fa_train_bf16_supported(op, cc)) {
+            return false;
+        }
+    } else {
+        if ((enum ggml_prec) ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16) {
+            return false;   // a BF16 request on f32 operands: no kernel means that
+        }
+        if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float)) {
+            return false;
+        }
     }
 
     const int64_t D = q->ne[0];
@@ -885,7 +1286,8 @@ void ggml_cuda_flash_attn_train(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * v    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    GGML_ASSERT(ggml_cuda_flash_attn_train_supported(dst));
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(ggml_cuda_flash_attn_train_supported(dst, cc));
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_nelements(dst) == ggml_flash_attn_train_nelements(q));
 
@@ -899,9 +1301,11 @@ void ggml_cuda_flash_attn_train(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // Resolved ONCE (design 3.3): the launch below, the trace line and the
     // parity tool's `prec` column all read this one answer.
-    const int                    cc   = ggml_cuda_info().devices[ctx.device].cc;
     const fa_train_prec_resolved prec = fa_train_resolve_prec(dst, cc, /*back =*/ false);
     g_fa_train_last_prec[0] = prec.label;
+    if (fa_train_is_bf16(dst) && prec.mode != FA_TRAIN_PREC_BF16) {
+        GGML_ABORT("ggml_cuda_flash_attn_train: BF16 Q/K/V did not resolve to the BF16 kernel: %s", prec.label);
+    }
 
     static bool traced_fwd = false;
     fa_train_trace(traced_fwd, "flash_attn_train (forward)", D, S, S_kv, Nh, Nkv, Bn,
@@ -943,6 +1347,20 @@ void ggml_cuda_flash_attn_train(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int64_t mne1 = mask ? mask->ne[1] : 1;
     const int64_t mne2 = mask ? mask->ne[2] : 1;
     const int64_t mne3 = mask ? mask->ne[3] : 1;
+
+    if (prec.mode == FA_TRAIN_PREC_BF16) {
+        const dim3 grid_bf16((unsigned) ((S + FA_TRAIN_BF16_BQ - 1)/FA_TRAIN_BF16_BQ),
+                             (unsigned) Nh, (unsigned) Bn);
+        const dim3 block_bf16(WARP_SIZE, FA_TRAIN_BF16_NW);
+        fa_train_fwd_bf16<128><<<grid_bf16, block_bf16, 0, stream>>>(
+                q_base, k_base, v_base, m_base, o_data, lse_data,
+                (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+                (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+                (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+                mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     if (prec.mode == FA_TRAIN_PREC_TF32) {
         // D == 128 is guaranteed by the resolver -- D = 64 is a written-down
@@ -2331,10 +2749,583 @@ fa_train_bwd_dq_tf32(
 #endif // AMPERE_MMA_AVAILABLE
 }
 
-bool ggml_cuda_flash_attn_train_back_supported(const ggml_tensor * op) {
+// ─── BF16 backward (S2c) ────────────────────────────────────────────────────
+//
+// The TF32 backward's contract (packed F32 dQ | dK | dV, P from the stored
+// LSE, masked and out-of-range terms bitwise zero, no atomics, fixed order)
+// on m16n8k16 BF16 products with f32 accumulate, using the forward's measured
+// fragment maps (see the BF16 forward). Rounded to BF16 once each, at the MMA
+// boundary: Q/K/V (already BF16 storage), dO, P (dV's operand) and dS (dQ's
+// and dK's). Scores, P before rounding, dP, dS before rounding, D_i and every
+// accumulator stay f32. dQ and dK/dV are two kernels for the same reason as
+// TF32: dQ reduces over keys, dK/dV over queries, and neither may use atomics.
+
+#define FA_TRAIN_BF16_DQ_NW 4                          // warps per block, 16 queries each
+#define FA_TRAIN_BF16_DQ_BQ (FA_TRAIN_BF16_DQ_NW*16)
+#define FA_TRAIN_BF16_DQ_BK 32                         // keys per staged tile
+
+// dQ. One block per (BQ-query tile, head, batch); each warp owns 16 query rows
+// and all D output columns. Q and dO are A fragments in registers, loaded once,
+// exactly like the forward's Q. Per key tile: S = Q K^T, dP = dO V^T (B from the
+// row-major K/V tiles, the forward's QK read), dS in f32, then dQ += dS K with
+// dS's C tiles as the A fragment and K's B fragment by ldmatrix.trans (the
+// forward's PV read).
+template <int D>
+static __global__ void __launch_bounds__(FA_TRAIN_BF16_DQ_NW*WARP_SIZE, 1)
+fa_train_bwd_dq_bf16(
+        const char  * __restrict__ q_base,
+        const char  * __restrict__ k_base,
+        const char  * __restrict__ v_base,
+        const half  * __restrict__ mask,
+        const float * __restrict__ do_data,
+        const float * __restrict__ lse_data,
+        const float * __restrict__ delta,
+        float       * __restrict__ dq_data,
+        const int64_t q_nb1, const int64_t q_nb2, const int64_t q_nb3,
+        const int64_t k_nb1, const int64_t k_nb2, const int64_t k_nb3,
+        const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3,
+        const int64_t mne0, const int64_t mne1, const int64_t mne2, const int64_t mne3,
+        const int64_t S, const int64_t S_kv, const int64_t Nh, const int64_t G,
+        const float scale) {
+#ifdef AMPERE_MMA_AVAILABLE
+    constexpr int NW  = FA_TRAIN_BF16_DQ_NW;
+    constexpr int BQ  = FA_TRAIN_BF16_DQ_BQ;
+    constexpr int BK  = FA_TRAIN_BF16_DQ_BK;
+    constexpr int NT  = NW*WARP_SIZE;
+    constexpr int NKS = D/16;
+    constexpr int NDB = D/8;
+    constexpr int NNB = BK/8;
+    constexpr int DP  = D + 8;
+    constexpr int WPR = D/2;
+
+    static_assert(BK % 16 == 0, "dS is whole k16 A fragments");
+    static_assert(NT % WPR == 0 && BK % (NT/WPR) == 0, "the staging loop assumes whole rows per pass");
+    static_assert(BQ*BK % NT == 0, "the liveness scan assumes an exact divide");
+
+    __shared__ __align__(16) __nv_bfloat16 Ksh[BK*DP];
+    __shared__ __align__(16) __nv_bfloat16 Vsh[BK*DP];
+
+    const int lane = threadIdx.x;
+    const int w    = threadIdx.y;
+    const int tid  = w*WARP_SIZE + lane;
+    const int g    = lane/4;
+    const int t    = lane%4;
+
+    const int64_t qb0 = (int64_t) blockIdx.x*BQ;
+    const int64_t q0  = qb0 + 16*w;
+    const int64_t h   = blockIdx.y;
+    const int64_t b   = blockIdx.z;
+    const int64_t hk  = h/G;
+
+    const int64_t ia  = q0     + g;
+    const int64_t ic  = q0 + 8 + g;
+    const bool    oka = ia < S;
+    const bool    okc = ic < S;
+
+    const int mstride = (int) mne0;
+
+    // Q and dO -> A fragments (register r: row g + 8*(r%2), d = 16ks + 2t +
+    // 8*(r/2) + {0,1}). Q is BF16 storage, one word per pair; dO is f32 and
+    // rounded to BF16 here, once. Rows past S are zero.
+    uint32_t qa[NKS][4];
+    uint32_t oa[NKS][4];
+    {
+        const uint32_t * qra = (const uint32_t *) (q_base + (oka ? ia : 0)*q_nb1 + h*q_nb2 + b*q_nb3);
+        const uint32_t * qrc = (const uint32_t *) (q_base + (okc ? ic : 0)*q_nb1 + h*q_nb2 + b*q_nb3);
+        const float2   * ora = (const float2 *) (do_data + (size_t) D*(h + Nh*((oka ? ia : 0) + S*b)));
+        const float2   * orc = (const float2 *) (do_data + (size_t) D*(h + Nh*((okc ? ic : 0) + S*b)));
+#pragma unroll
+        for (int ks = 0; ks < NKS; ++ks) {
+            const int w0 = 8*ks + t;
+            const int w1 = w0 + 4;
+            qa[ks][0] = oka ? qra[w0] : 0u;
+            qa[ks][1] = okc ? qrc[w0] : 0u;
+            qa[ks][2] = oka ? qra[w1] : 0u;
+            qa[ks][3] = okc ? qrc[w1] : 0u;
+            const float2 a0 = oka ? ora[w0] : make_float2(0.0f, 0.0f);
+            const float2 c0 = okc ? orc[w0] : make_float2(0.0f, 0.0f);
+            const float2 a1 = oka ? ora[w1] : make_float2(0.0f, 0.0f);
+            const float2 c1 = okc ? orc[w1] : make_float2(0.0f, 0.0f);
+            oa[ks][0] = fa_bf16::pack(a0.x, a0.y);
+            oa[ks][1] = fa_bf16::pack(c0.x, c0.y);
+            oa[ks][2] = fa_bf16::pack(a1.x, a1.y);
+            oa[ks][3] = fa_bf16::pack(c1.x, c1.y);
+        }
+    }
+
+    float lse_a = 0.0f, lse_c = 0.0f;
+    float del_a = 0.0f, del_c = 0.0f;
+    if (oka) {
+        const int64_t r = h + Nh*(ia + S*b);
+        lse_a = lse_data[r];
+        del_a = delta   [r];
+    }
+    if (okc) {
+        const int64_t r = h + Nh*(ic + S*b);
+        lse_c = lse_data[r];
+        del_c = delta   [r];
+    }
+
+    const half * mrow_a = nullptr;
+    const half * mrow_c = nullptr;
+    const half * mtile0 = nullptr;
+    if (mask) {
+        const half * mhb = mask + mne0*mne1*((h % mne2) + mne2*(b % mne3));
+        mrow_a = mhb + mne0*(oka ? ia : 0);
+        mrow_c = mhb + mne0*(okc ? ic : 0);
+        mtile0 = mhb + mne0*qb0;
+    }
+
+    const char * kp0 = k_base + hk*k_nb2 + b*k_nb3;
+    const char * vp0 = v_base + hk*v_nb2 + b*v_nb3;
+
+    float dqacc[NDB][4];
+#pragma unroll
+    for (int db = 0; db < NDB; ++db) {
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            dqacc[db][l] = 0.0f;
+        }
+    }
+
+    for (int64_t j0 = 0; j0 < S_kv; j0 += BK) {
+        const int    nk   = (int) min((int64_t) BK, S_kv - j0);
+        const half * ma_t = mrow_a ? mrow_a + j0 : nullptr;
+        const half * mc_t = mrow_c ? mrow_c + j0 : nullptr;
+
+        // Coalesced BQ x BK liveness scan; its barrier also fences the previous
+        // tile's K/V reads.
+        bool anylive = (mask == nullptr);
+        if (mask) {
+            const half * mtile = mtile0 + j0;
+#pragma unroll
+            for (int it = 0; it < BQ*BK/NT; ++it) {
+                const int idx = tid + it*NT;
+                const int jj  = idx%BK;
+                const int ii  = idx/BK;
+                if (jj < nk && qb0 + ii < S) {
+                    anylive = anylive || (__half2float(mtile[jj + mstride*ii]) != -INFINITY);
+                }
+            }
+        }
+        if (!__syncthreads_or(anylive)) {
+            continue;
+        }
+
+        {
+            const int jj0 = tid/WPR;
+            const int wd  = tid%WPR;
+#pragma unroll
+            for (int jj = jj0; jj < BK; jj += NT/WPR) {
+                uint32_t kw = 0u;
+                uint32_t vw = 0u;
+                if (jj < nk) {
+                    kw = ((const uint32_t *) (kp0 + (j0 + jj)*k_nb1))[wd];
+                    vw = ((const uint32_t *) (vp0 + (j0 + jj)*v_nb1))[wd];
+                }
+                *(uint32_t *) (Ksh + jj*DP + 2*wd) = kw;
+                *(uint32_t *) (Vsh + jj*DP + 2*wd) = vw;
+            }
+        }
+        __syncthreads();
+
+        // S = Q K^T and dP = dO V^T, the forward's QK read on both tiles.
+        float sacc[NNB][4];
+        float dpacc[NNB][4];
+#pragma unroll
+        for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                sacc[nb][l]  = 0.0f;
+                dpacc[nb][l] = 0.0f;
+            }
+            const __nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
+            const __nv_bfloat16 * vrow = Vsh + (8*nb + g)*DP + 2*t;
+#pragma unroll
+            for (int ks = 0; ks < NKS; ++ks) {
+                uint32_t kb[2];
+                uint32_t vb[2];
+                kb[0] = *(const uint32_t *) (krow + 16*ks);
+                kb[1] = *(const uint32_t *) (krow + 16*ks + 8);
+                vb[0] = *(const uint32_t *) (vrow + 16*ks);
+                vb[1] = *(const uint32_t *) (vrow + 16*ks + 8);
+                fa_bf16::mma_m16n8k16(sacc[nb],  qa[ks], kb);
+                fa_bf16::mma_m16n8k16(dpacc[nb], oa[ks], vb);
+            }
+        }
+
+        // P = exp(s - LSE_i), dS = scale*P*(dP - D_i); dS overwrites dP.
+#pragma unroll
+        for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int    col = 8*nb + 2*t + (l%2);
+                const bool   ok  = (l < 2) ? oka : okc;
+                const half * mr  = (l < 2) ? ma_t : mc_t;
+                float mv = -INFINITY;
+                if (ok && col < nk) {
+                    mv = mr ? __half2float(mr[col]) : 0.0f;
+                }
+                const float p = fa_bwd_p(sacc[nb][l], scale, mv, (l < 2) ? lse_a : lse_c);
+                dpacc[nb][l]  = fa_bwd_ds(p, dpacc[nb][l], (l < 2) ? del_a : del_c, scale);
+            }
+        }
+
+        // dQ += dS K, one k16 slice of keys at a time.
+#pragma unroll
+        for (int kk = 0; kk < NNB/2; ++kk) {
+            uint32_t da[4];
+            da[0] = fa_bf16::pack(dpacc[2*kk    ][0], dpacc[2*kk    ][1]);
+            da[1] = fa_bf16::pack(dpacc[2*kk    ][2], dpacc[2*kk    ][3]);
+            da[2] = fa_bf16::pack(dpacc[2*kk + 1][0], dpacc[2*kk + 1][1]);
+            da[3] = fa_bf16::pack(dpacc[2*kk + 1][2], dpacc[2*kk + 1][3]);
+            const __nv_bfloat16 * krow = Ksh + (16*kk + lane%16)*DP;
+#pragma unroll
+            for (int db = 0; db < NDB; ++db) {
+                uint32_t kb[2];
+                fa_bf16::ldmatrix_b_trans(kb, krow + 8*db);
+                fa_bf16::mma_m16n8k16(dqacc[db], da, kb);
+            }
+        }
+    }
+
+    const int dj = 2*t;
+    if (oka) {
+        float * out = dq_data + (size_t) D*(ia + S*(h + Nh*b));
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            out[8*db + dj    ] = dqacc[db][0];
+            out[8*db + dj + 1] = dqacc[db][1];
+        }
+    }
+    if (okc) {
+        float * out = dq_data + (size_t) D*(ic + S*(h + Nh*b));
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            out[8*db + dj    ] = dqacc[db][2];
+            out[8*db + dj + 1] = dqacc[db][3];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(q_base, k_base, v_base, mask, do_data, lse_data, delta, dq_data,
+                     q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3,
+                     mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+#define FA_TRAIN_BF16_DKDV_KG 2                                        // 16-key groups per block
+#define FA_TRAIN_BF16_DKDV_DH 2                                        // d-halves per key group
+#define FA_TRAIN_BF16_DKDV_NW (FA_TRAIN_BF16_DKDV_KG*FA_TRAIN_BF16_DKDV_DH)
+#define FA_TRAIN_BF16_DKDV_BJ (FA_TRAIN_BF16_DKDV_KG*16)               // kv rows owned per block
+#define FA_TRAIN_BF16_DKDV_BI 32                                       // query rows per staged tile
+
+// dK / dV. One block per (BJ-key tile, kv head, GQA split, batch); KG x DH
+// warps, each owning 16 keys x D/DH output columns, so no cross-warp
+// reduction. The two warps of a key group compute S^T = K Q^T and
+// dP^T = V dO^T redundantly (both reduce over the full D), as the TF32 kernel
+// does. K/V are A fragments read from the resident tiles; Q and dO are B
+// fragments, read like the forward's K for S^T/dP^T and by ldmatrix.trans like
+// the forward's V for dV += P^T dO and dK += dS^T Q. P^T and dS^T feed those
+// products straight from their C tiles (two n8 tiles are one k16 A fragment).
+// Query heads ascending, then query tiles ascending; GS > 1 writes partial
+// planes that fa_train_bwd_gsum_f32 folds, as in TF32.
+template <int D>
+static __global__ void __launch_bounds__(FA_TRAIN_BF16_DKDV_NW*WARP_SIZE, 2)
+fa_train_bwd_dkdv_bf16(
+        const char  * __restrict__ q_base,
+        const char  * __restrict__ k_base,
+        const char  * __restrict__ v_base,
+        const half  * __restrict__ mask,
+        const float * __restrict__ do_data,
+        const float * __restrict__ lse_data,
+        const float * __restrict__ delta,
+        float       * __restrict__ dk_data,
+        float       * __restrict__ dv_data,
+        const int64_t q_nb1, const int64_t q_nb2, const int64_t q_nb3,
+        const int64_t k_nb1, const int64_t k_nb2, const int64_t k_nb3,
+        const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3,
+        const int64_t mne0, const int64_t mne1, const int64_t mne2, const int64_t mne3,
+        const int64_t S, const int64_t S_kv, const int64_t Nh, const int64_t Nkv,
+        const int64_t G, const float scale,
+        const int GS, const int64_t part_stride) {
+#ifdef AMPERE_MMA_AVAILABLE
+    constexpr int DH  = FA_TRAIN_BF16_DKDV_DH;
+    constexpr int NW  = FA_TRAIN_BF16_DKDV_NW;
+    constexpr int BJ  = FA_TRAIN_BF16_DKDV_BJ;
+    constexpr int BI  = FA_TRAIN_BF16_DKDV_BI;
+    constexpr int NT  = NW*WARP_SIZE;
+    constexpr int DW  = D/DH;
+    constexpr int NDB = DW/8;
+    constexpr int NKS = D/16;
+    constexpr int NNB = BI/8;
+    constexpr int DP  = D + 8;
+    constexpr int WPR = D/2;
+
+    static_assert(BI % 16 == 0, "P^T and dS^T are whole k16 A fragments");
+    static_assert(DW % 8 == 0, "the d split must land on 8-wide blocks");
+    static_assert(NT % WPR == 0 && BJ % (NT/WPR) == 0 && BI % (NT/WPR) == 0,
+                  "the staging loops assume whole rows per pass");
+
+    __shared__ __align__(16) __nv_bfloat16 Ksh [BJ*DP];
+    __shared__ __align__(16) __nv_bfloat16 Vsh [BJ*DP];
+    __shared__ __align__(16) __nv_bfloat16 Qsh [BI*DP];
+    __shared__ __align__(16) __nv_bfloat16 dOsh[BI*DP];
+    __shared__ float lse_sh[BI];
+    __shared__ float del_sh[BI];
+
+    const int lane  = threadIdx.x;
+    const int w     = threadIdx.y;
+    const int tid   = w*WARP_SIZE + lane;
+    const int g4    = lane/4;
+    const int t4    = lane%4;
+    const int kg    = w / DH;
+    const int dbase = (w % DH)*DW;
+    const int krow  = 16*kg;       // this warp's first key row of the tile
+
+    const int64_t j0b  = (int64_t) blockIdx.x*BJ;
+    const int64_t hk   = blockIdx.y / GS;
+    const int64_t gsp  = blockIdx.y % GS;
+    const int64_t gper = G/GS;
+    const int64_t gbeg = gsp*gper;
+    const int64_t b    = blockIdx.z;
+
+    const int64_t ja  = j0b + krow + g4;
+    const int64_t jc  = ja + 8;
+    const bool    oka = ja < S_kv;
+    const bool    okc = jc < S_kv;
+
+    const int mstride = (int) mne0;
+
+    // The block's BJ K/V rows, resident for the whole sweep; rows past S_kv
+    // are zero. Published by the first tile's barrier.
+    {
+        const int jj0 = tid/WPR;
+        const int wd  = tid%WPR;
+#pragma unroll
+        for (int jj = jj0; jj < BJ; jj += NT/WPR) {
+            uint32_t kw = 0u;
+            uint32_t vw = 0u;
+            if (j0b + jj < S_kv) {
+                kw = ((const uint32_t *) (k_base + hk*k_nb2 + b*k_nb3 + (j0b + jj)*k_nb1))[wd];
+                vw = ((const uint32_t *) (v_base + hk*v_nb2 + b*v_nb3 + (j0b + jj)*v_nb1))[wd];
+            }
+            *(uint32_t *) (Ksh + jj*DP + 2*wd) = kw;
+            *(uint32_t *) (Vsh + jj*DP + 2*wd) = vw;
+        }
+    }
+
+    float dkacc[NDB][4];
+    float dvacc[NDB][4];
+#pragma unroll
+    for (int db = 0; db < NDB; ++db) {
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            dkacc[db][l] = 0.0f;
+            dvacc[db][l] = 0.0f;
+        }
+    }
+
+    for (int64_t g = gbeg; g < gbeg + gper; ++g) {
+        const int64_t h  = hk*G + g;
+        const char  * qh = q_base + h*q_nb2 + b*q_nb3;
+        const int64_t rh = h + Nh*S*b;                   // + Nh*i
+
+        const half * mca = nullptr;
+        const half * mcc = nullptr;
+        const half * mhb = nullptr;
+        if (mask) {
+            mhb = mask + mne0*mne1*((h % mne2) + mne2*(b % mne3));
+            mca = mhb + (oka ? ja : 0);
+            mcc = mhb + (okc ? jc : 0);
+        }
+
+        for (int64_t i0 = 0; i0 < S; i0 += BI) {
+            const int    ni   = (int) min((int64_t) BI, S - i0);
+            const half * ma_t = mca ? mca + mne0*i0 : nullptr;
+            const half * mc_t = mcc ? mcc + mne0*i0 : nullptr;
+
+            // Coalesced BJ x BI liveness scan; the barrier also fences the
+            // previous tile's Q/dO reads.
+            bool anylive = (mask == nullptr);
+            if (mask) {
+                const half * mtile = mhb + j0b + mne0*i0;
+#pragma unroll
+                for (int it = 0; it < (BJ*BI + NT - 1)/NT; ++it) {
+                    const int idx = tid + it*NT;
+                    if (idx < BJ*BI) {
+                        const int jj = idx%BJ;
+                        const int ii = idx/BJ;
+                        if (ii < ni && j0b + jj < S_kv) {
+                            anylive = anylive || (__half2float(mtile[jj + mstride*ii]) != -INFINITY);
+                        }
+                    }
+                }
+            }
+            if (!__syncthreads_or(anylive)) {
+                continue;
+            }
+
+            // Stage Q (BF16 words) and dO (f32 pairs rounded to BF16 once),
+            // plus LSE and D_i; rows past S are zero.
+            {
+                const int ii0 = tid/WPR;
+                const int wd  = tid%WPR;
+#pragma unroll
+                for (int ii = ii0; ii < BI; ii += NT/WPR) {
+                    uint32_t qw = 0u;
+                    uint32_t ow = 0u;
+                    if (ii < ni) {
+                        qw = ((const uint32_t *) (qh + (i0 + ii)*q_nb1))[wd];
+                        const float2 o2 = ((const float2 *) (do_data + (size_t) D*(h + Nh*((i0 + ii) + S*b))))[wd];
+                        ow = fa_bf16::pack(o2.x, o2.y);
+                    }
+                    *(uint32_t *) (Qsh  + ii*DP + 2*wd) = qw;
+                    *(uint32_t *) (dOsh + ii*DP + 2*wd) = ow;
+                }
+            }
+            for (int idx = tid; idx < BI; idx += NT) {
+                float lv = 0.0f;
+                float dv = 0.0f;
+                if (idx < ni) {
+                    lv = lse_data[rh + Nh*(i0 + idx)];
+                    dv = delta   [rh + Nh*(i0 + idx)];
+                }
+                lse_sh[idx] = lv;
+                del_sh[idx] = dv;
+            }
+            __syncthreads();
+
+            // S^T = K Q^T and dP^T = V dO^T. A = this warp's 16 K (V) rows
+            // (register r: row g + 8*(r%2), d = 16ks + 2t + 8*(r/2));
+            // B = Q (dO) row 8nb + g, the forward's QK read.
+            float sacc[NNB][4];
+            float dpacc[NNB][4];
+#pragma unroll
+            for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    sacc[nb][l]  = 0.0f;
+                    dpacc[nb][l] = 0.0f;
+                }
+            }
+            {
+                const __nv_bfloat16 * kra = Ksh + (krow + g4)*DP + 2*t4;
+                const __nv_bfloat16 * vra = Vsh + (krow + g4)*DP + 2*t4;
+#pragma unroll
+                for (int ks = 0; ks < NKS; ++ks) {
+                    uint32_t ka[4];
+                    uint32_t va[4];
+                    ka[0] = *(const uint32_t *) (kra + 16*ks);
+                    ka[1] = *(const uint32_t *) (kra + 16*ks + 8*DP);
+                    ka[2] = *(const uint32_t *) (kra + 16*ks + 8);
+                    ka[3] = *(const uint32_t *) (kra + 16*ks + 8*DP + 8);
+                    va[0] = *(const uint32_t *) (vra + 16*ks);
+                    va[1] = *(const uint32_t *) (vra + 16*ks + 8*DP);
+                    va[2] = *(const uint32_t *) (vra + 16*ks + 8);
+                    va[3] = *(const uint32_t *) (vra + 16*ks + 8*DP + 8);
+#pragma unroll
+                    for (int nb = 0; nb < NNB; ++nb) {
+                        const __nv_bfloat16 * qrow = Qsh  + (8*nb + g4)*DP + 2*t4 + 16*ks;
+                        const __nv_bfloat16 * orow = dOsh + (8*nb + g4)*DP + 2*t4 + 16*ks;
+                        uint32_t qb[2];
+                        uint32_t ob[2];
+                        qb[0] = *(const uint32_t *) (qrow);
+                        qb[1] = *(const uint32_t *) (qrow + 8);
+                        ob[0] = *(const uint32_t *) (orow);
+                        ob[1] = *(const uint32_t *) (orow + 8);
+                        fa_bf16::mma_m16n8k16(sacc[nb],  ka, qb);
+                        fa_bf16::mma_m16n8k16(dpacc[nb], va, ob);
+                    }
+                }
+            }
+
+            // P^T and dS^T in f32 (key = the C row, query = the C column);
+            // the -INF test is on the mask value.
+#pragma unroll
+            for (int nb = 0; nb < NNB; ++nb) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int    ql = 8*nb + 2*t4 + (l%2);
+                    const bool   ok = (l < 2) ? oka : okc;
+                    const half * mr = (l < 2) ? ma_t : mc_t;
+                    float mv = -INFINITY;
+                    if (ok && ql < ni) {
+                        mv = mr ? __half2float(mr[mstride*ql]) : 0.0f;
+                    }
+                    const float p = fa_bwd_p(sacc[nb][l], scale, mv, lse_sh[ql]);
+                    sacc[nb][l]   = p;
+                    dpacc[nb][l]  = fa_bwd_ds(p, dpacc[nb][l], del_sh[ql], scale);
+                }
+            }
+
+            // dV += P^T dO and dK += dS^T Q over this warp's d columns.
+#pragma unroll
+            for (int kk = 0; kk < NNB/2; ++kk) {
+                uint32_t pa[4];
+                uint32_t da[4];
+                pa[0] = fa_bf16::pack(sacc [2*kk    ][0], sacc [2*kk    ][1]);
+                pa[1] = fa_bf16::pack(sacc [2*kk    ][2], sacc [2*kk    ][3]);
+                pa[2] = fa_bf16::pack(sacc [2*kk + 1][0], sacc [2*kk + 1][1]);
+                pa[3] = fa_bf16::pack(sacc [2*kk + 1][2], sacc [2*kk + 1][3]);
+                da[0] = fa_bf16::pack(dpacc[2*kk    ][0], dpacc[2*kk    ][1]);
+                da[1] = fa_bf16::pack(dpacc[2*kk    ][2], dpacc[2*kk    ][3]);
+                da[2] = fa_bf16::pack(dpacc[2*kk + 1][0], dpacc[2*kk + 1][1]);
+                da[3] = fa_bf16::pack(dpacc[2*kk + 1][2], dpacc[2*kk + 1][3]);
+                const __nv_bfloat16 * orow = dOsh + (16*kk + lane%16)*DP + dbase;
+                const __nv_bfloat16 * qrow = Qsh  + (16*kk + lane%16)*DP + dbase;
+#pragma unroll
+                for (int db = 0; db < NDB; ++db) {
+                    uint32_t ob[2];
+                    uint32_t qb[2];
+                    fa_bf16::ldmatrix_b_trans(ob, orow + 8*db);
+                    fa_bf16::ldmatrix_b_trans(qb, qrow + 8*db);
+                    fa_bf16::mma_m16n8k16(dvacc[db], pa, ob);
+                    fa_bf16::mma_m16n8k16(dkacc[db], da, qb);
+                }
+            }
+        }
+    }
+
+    float * dk_out = dk_data + gsp*part_stride;
+    float * dv_out = dv_data + gsp*part_stride;
+    const int dj = 2*t4;
+    if (oka) {
+        const size_t off = (size_t) D*(ja + S_kv*(hk + Nkv*b));
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            const size_t o = off + dbase + 8*db + dj;
+            dk_out[o    ] = dkacc[db][0];
+            dk_out[o + 1] = dkacc[db][1];
+            dv_out[o    ] = dvacc[db][0];
+            dv_out[o + 1] = dvacc[db][1];
+        }
+    }
+    if (okc) {
+        const size_t off = (size_t) D*(jc + S_kv*(hk + Nkv*b));
+#pragma unroll
+        for (int db = 0; db < NDB; ++db) {
+            const size_t o = off + dbase + 8*db + dj;
+            dk_out[o    ] = dkacc[db][2];
+            dk_out[o + 1] = dkacc[db][3];
+            dv_out[o    ] = dvacc[db][2];
+            dv_out[o + 1] = dvacc[db][3];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(q_base, k_base, v_base, mask, do_data, lse_data, delta,
+                     dk_data, dv_data,
+                     q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3,
+                     mne0, mne1, mne2, mne3, S, S_kv, Nh, Nkv, G, scale,
+                     GS, part_stride);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+bool ggml_cuda_flash_attn_train_back_supported(const ggml_tensor * op, const int cc) {
     // src[0..3] and op_params are exactly the forward's, so the shape/type
     // capability check is shared rather than duplicated.
-    if (!ggml_cuda_flash_attn_train_supported(op)) {
+    if (!ggml_cuda_flash_attn_train_supported(op, cc)) {
         return false;
     }
 
@@ -2367,7 +3358,8 @@ void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * fwd  = dst->src[4];
     const ggml_tensor * dfwd = dst->src[5];
 
-    GGML_ASSERT(ggml_cuda_flash_attn_train_back_supported(dst));
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(ggml_cuda_flash_attn_train_back_supported(dst, cc));
     GGML_ASSERT(ggml_is_contiguous(dst));
     // spec 5.2: ggml_scale(packed, 0.0f) must never run in place, and this op
     // must never alias the forward it reads O and LSE out of.
@@ -2384,9 +3376,11 @@ void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tenso
     // Same resolver, same rule, `back = true`. Recorded and traced rather than
     // assumed: the label carries the reason, so a run's arithmetic is readable
     // off the trace instead of inferred from the flag.
-    const int                    cc   = ggml_cuda_info().devices[ctx.device].cc;
     const fa_train_prec_resolved prec = fa_train_resolve_prec(dst, cc, /*back =*/ true);
     g_fa_train_last_prec[1] = prec.label;
+    if (fa_train_is_bf16(dst) && prec.mode != FA_TRAIN_PREC_BF16) {
+        GGML_ABORT("ggml_cuda_flash_attn_train_back: BF16 Q/K/V did not resolve to the BF16 kernels: %s", prec.label);
+    }
 
     static bool traced_bwd = false;
     fa_train_trace(traced_bwd, "flash_attn_train_back (backward)", D, S, S_kv, Nh, Nkv, Bn,
@@ -2475,6 +3469,58 @@ void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tenso
                 (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],                   \
                 mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);                               \
     } while (0)
+
+    if (prec.mode == FA_TRAIN_PREC_BF16) {
+        // D == 128 and sm_80+ are guaranteed by the support check. Same delta
+        // pass, same GQA split rule and gsum fold as TF32, on BF16's key tile.
+        const dim3 block_dkdv(WARP_SIZE, FA_TRAIN_BF16_DKDV_NW);
+        const dim3 block_dq  (WARP_SIZE, FA_TRAIN_BF16_DQ_NW);
+        const dim3 grid_dq_bf16((unsigned) ((S + FA_TRAIN_BF16_DQ_BQ - 1)/FA_TRAIN_BF16_DQ_BQ),
+                                (unsigned) Nh, (unsigned) Bn);
+
+        const int64_t nkv_tiles = (S_kv + FA_TRAIN_BF16_DKDV_BJ - 1)/FA_TRAIN_BF16_DKDV_BJ;
+        const int     GS        = fa_train_dkdv_gsplit(nkv_tiles, Nkv, Bn, G);
+        const int64_t n_kv_el   = D*S_kv*Nkv*Bn;
+        const dim3    grid_dkdv_bf16((unsigned) nkv_tiles, (unsigned) (Nkv*GS), (unsigned) Bn);
+
+        ggml_cuda_pool_alloc<float> dkv_part(ctx.pool());
+        float * dk_dst = dk_data;
+        float * dv_dst = dv_data;
+        int64_t part_stride = 0;
+        if (GS > 1) {
+            dkv_part.alloc((size_t) 2*GS*n_kv_el);
+            dk_dst      = dkv_part.get();
+            dv_dst      = dkv_part.get() + (size_t) GS*n_kv_el;
+            part_stride = n_kv_el;
+        }
+
+        fa_train_bwd_delta_f32<128><<<grid_delta, block, 0, stream>>>(
+                o_data, do_data, delta.get(), nrows);
+        fa_train_bwd_dkdv_bf16<128><<<grid_dkdv_bf16, block_dkdv, 0, stream>>>(
+                q_base, k_base, v_base, m_base, do_data, lse_data, delta.get(),
+                dk_dst, dv_dst,
+                (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+                (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+                (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+                mne0, mne1, mne2, mne3, S, S_kv, Nh, Nkv, G, scale, GS, part_stride);
+        if (GS > 1) {
+            const int64_t nthr = 256;
+            const dim3    grid_sum((unsigned) ((n_kv_el + nthr - 1)/nthr), 1, 1);
+            fa_train_bwd_gsum_f32<<<grid_sum, (unsigned) nthr, 0, stream>>>(
+                    dk_dst, dk_data, n_kv_el, part_stride, GS);
+            fa_train_bwd_gsum_f32<<<grid_sum, (unsigned) nthr, 0, stream>>>(
+                    dv_dst, dv_data, n_kv_el, part_stride, GS);
+        }
+        fa_train_bwd_dq_bf16<128><<<grid_dq_bf16, block_dq, 0, stream>>>(
+                q_base, k_base, v_base, m_base, do_data, lse_data, delta.get(),
+                dq_data,
+                (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+                (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+                (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+                mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     if (prec.mode == FA_TRAIN_PREC_TF32) {
         // D == 128 is guaranteed by the resolver (D = 64 is a written-down scope

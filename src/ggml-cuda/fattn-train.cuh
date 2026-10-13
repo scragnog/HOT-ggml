@@ -12,15 +12,16 @@
 void ggml_cuda_flash_attn_train(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Capability check for ggml_backend_cuda_device_supports_op. Shape/type only --
-// it is called on graph nodes that have no data yet.
-bool ggml_cuda_flash_attn_train_supported(const ggml_tensor * op);
+// it is called on graph nodes that have no data yet. `cc` is the device's
+// compute capability: BF16 Q/K/V are accepted only where the BF16 kernels run.
+bool ggml_cuda_flash_attn_train_supported(const ggml_tensor * op, int cc);
 
 // HOT-Step patch: flash-attn-train
 // Backward: three atomics-free kernels (delta / dK+dV / dQ), packed dQ|dK|dV.
 void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Capability check for ggml_backend_cuda_device_supports_op. Shape/type only.
-bool ggml_cuda_flash_attn_train_back_supported(const ggml_tensor * op);
+bool ggml_cuda_flash_attn_train_back_supported(const ggml_tensor * op, int cc);
 
 // HOT-Step patch: flash-attn-train
 // Which arithmetic the last CUDA launch of each direction actually used.

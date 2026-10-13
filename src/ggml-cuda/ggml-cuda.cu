@@ -5684,9 +5684,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         // looks like a pass. Both directions have CUDA kernels now, and both
         // report their real shape/type capability rather than a blanket yes.
         case GGML_OP_FLASH_ATTN_TRAIN:
-            return ggml_cuda_flash_attn_train_supported(op);
+            return ggml_cuda_flash_attn_train_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
         case GGML_OP_FLASH_ATTN_TRAIN_BACK:
-            return ggml_cuda_flash_attn_train_back_supported(op);
+            return ggml_cuda_flash_attn_train_back_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
 
         default:
             return false;
