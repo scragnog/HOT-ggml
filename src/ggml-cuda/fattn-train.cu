@@ -2804,6 +2804,11 @@ fa_train_bwd_dq_bf16(
 
     __shared__ __align__(16) __nv_bfloat16 Ksh[BK*DP];
     __shared__ __align__(16) __nv_bfloat16 Vsh[BK*DP];
+    // The liveness scan's mask tile, kept for P: double-buffered by tile so the
+    // next scan can write while a slower warp still reads, rows padded so the
+    // C-map read (8 rows x 4 column pairs) hits distinct banks.
+    constexpr int MS = BK + 8;
+    __shared__ __align__(16) half Msh[2][BQ*MS];
 
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
@@ -2866,14 +2871,9 @@ fa_train_bwd_dq_bf16(
         del_c = delta   [r];
     }
 
-    const half * mrow_a = nullptr;
-    const half * mrow_c = nullptr;
     const half * mtile0 = nullptr;
     if (mask) {
-        const half * mhb = mask + mne0*mne1*((h % mne2) + mne2*(b % mne3));
-        mrow_a = mhb + mne0*(oka ? ia : 0);
-        mrow_c = mhb + mne0*(okc ? ic : 0);
-        mtile0 = mhb + mne0*qb0;
+        mtile0 = mask + mne0*mne1*((h % mne2) + mne2*(b % mne3)) + mne0*qb0;
     }
 
     const char * kp0 = k_base + hk*k_nb2 + b*k_nb3;
@@ -2888,13 +2888,14 @@ fa_train_bwd_dq_bf16(
         }
     }
 
+    int mbuf = 0;
     for (int64_t j0 = 0; j0 < S_kv; j0 += BK) {
-        const int    nk   = (int) min((int64_t) BK, S_kv - j0);
-        const half * ma_t = mrow_a ? mrow_a + j0 : nullptr;
-        const half * mc_t = mrow_c ? mrow_c + j0 : nullptr;
+        const int nk  = (int) min((int64_t) BK, S_kv - j0);
+        half *    msh = Msh[mbuf];
+        mbuf ^= 1;
 
-        // Coalesced BQ x BK liveness scan; its barrier also fences the previous
-        // tile's K/V reads.
+        // Coalesced BQ x BK liveness scan, which also fills msh (-INF out of
+        // range); its barrier also fences the previous tile's K/V reads.
         bool anylive = (mask == nullptr);
         if (mask) {
             const half * mtile = mtile0 + j0;
@@ -2903,9 +2904,12 @@ fa_train_bwd_dq_bf16(
                 const int idx = tid + it*NT;
                 const int jj  = idx%BK;
                 const int ii  = idx/BK;
+                half mh = __ushort_as_half((unsigned short) 0xFC00);   // -INF
                 if (jj < nk && qb0 + ii < S) {
-                    anylive = anylive || (__half2float(mtile[jj + mstride*ii]) != -INFINITY);
+                    mh      = mtile[jj + mstride*ii];
+                    anylive = anylive || (__half2float(mh) != -INFINITY);
                 }
+                msh[ii*MS + jj] = mh;
             }
         }
         if (!__syncthreads_or(anylive)) {
@@ -2959,12 +2963,12 @@ fa_train_bwd_dq_bf16(
         for (int nb = 0; nb < NNB; ++nb) {
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
-                const int    col = 8*nb + 2*t + (l%2);
-                const bool   ok  = (l < 2) ? oka : okc;
-                const half * mr  = (l < 2) ? ma_t : mc_t;
-                float mv = -INFINITY;
-                if (ok && col < nk) {
-                    mv = mr ? __half2float(mr[col]) : 0.0f;
+                const int col = 8*nb + 2*t + (l%2);
+                float mv;
+                if (mask) {
+                    mv = __half2float(msh[(16*w + g + 8*(l/2))*MS + col]);
+                } else {
+                    mv = (((l < 2) ? oka : okc) && col < nk) ? 0.0f : -INFINITY;
                 }
                 const float p = fa_bwd_p(sacc[nb][l], scale, mv, (l < 2) ? lse_a : lse_c);
                 dpacc[nb][l]  = fa_bwd_ds(p, dpacc[nb][l], (l < 2) ? del_a : del_c, scale);
@@ -3073,6 +3077,9 @@ fa_train_bwd_dkdv_bf16(
     __shared__ __align__(16) __nv_bfloat16 dOsh[BI*DP];
     __shared__ float lse_sh[BI];
     __shared__ float del_sh[BI];
+    // The liveness scan's mask tile, kept for P^T (see the dQ kernel).
+    constexpr int MS = BJ + 8;
+    __shared__ __align__(16) half Msh[2][BI*MS];
 
     const int lane  = threadIdx.x;
     const int w     = threadIdx.y;
@@ -3126,24 +3133,21 @@ fa_train_bwd_dkdv_bf16(
         }
     }
 
+    int mbuf = 0;   // msh parity runs across heads: a reset could reuse a buffer still being read
     for (int64_t g = gbeg; g < gbeg + gper; ++g) {
         const int64_t h  = hk*G + g;
         const char  * qh = q_base + h*q_nb2 + b*q_nb3;
         const int64_t rh = h + Nh*S*b;                   // + Nh*i
 
-        const half * mca = nullptr;
-        const half * mcc = nullptr;
         const half * mhb = nullptr;
         if (mask) {
             mhb = mask + mne0*mne1*((h % mne2) + mne2*(b % mne3));
-            mca = mhb + (oka ? ja : 0);
-            mcc = mhb + (okc ? jc : 0);
         }
 
         for (int64_t i0 = 0; i0 < S; i0 += BI) {
-            const int    ni   = (int) min((int64_t) BI, S - i0);
-            const half * ma_t = mca ? mca + mne0*i0 : nullptr;
-            const half * mc_t = mcc ? mcc + mne0*i0 : nullptr;
+            const int ni  = (int) min((int64_t) BI, S - i0);
+            half *    msh = Msh[mbuf];
+            mbuf ^= 1;
 
             // Coalesced BJ x BI liveness scan; the barrier also fences the
             // previous tile's Q/dO reads.
@@ -3156,9 +3160,12 @@ fa_train_bwd_dkdv_bf16(
                     if (idx < BJ*BI) {
                         const int jj = idx%BJ;
                         const int ii = idx/BJ;
+                        half mh = __ushort_as_half((unsigned short) 0xFC00);   // -INF
                         if (ii < ni && j0b + jj < S_kv) {
-                            anylive = anylive || (__half2float(mtile[jj + mstride*ii]) != -INFINITY);
+                            mh      = mtile[jj + mstride*ii];
+                            anylive = anylive || (__half2float(mh) != -INFINITY);
                         }
+                        msh[ii*MS + jj] = mh;
                     }
                 }
             }
@@ -3246,12 +3253,12 @@ fa_train_bwd_dkdv_bf16(
             for (int nb = 0; nb < NNB; ++nb) {
 #pragma unroll
                 for (int l = 0; l < 4; ++l) {
-                    const int    ql = 8*nb + 2*t4 + (l%2);
-                    const bool   ok = (l < 2) ? oka : okc;
-                    const half * mr = (l < 2) ? ma_t : mc_t;
-                    float mv = -INFINITY;
-                    if (ok && ql < ni) {
-                        mv = mr ? __half2float(mr[mstride*ql]) : 0.0f;
+                    const int ql = 8*nb + 2*t4 + (l%2);
+                    float mv;
+                    if (mask) {
+                        mv = __half2float(msh[ql*MS + krow + g4 + 8*(l/2)]);
+                    } else {
+                        mv = (((l < 2) ? oka : okc) && ql < ni) ? 0.0f : -INFINITY;
                     }
                     const float p = fa_bwd_p(sacc[nb][l], scale, mv, lse_sh[ql]);
                     sacc[nb][l]   = p;
