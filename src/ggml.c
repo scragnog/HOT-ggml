@@ -5699,8 +5699,16 @@ struct ggml_tensor * ggml_flash_attn_train(
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
         float                 scale) {
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    // S2c: BF16 Q/K/V are now a structurally legal operand triple (same type,
+    // all F32 or all BF16); no mixed types. There is still no BF16 MMA kernel
+    // (RESEARCH/YUE2_S2C_DESIGN.md), so every backend's supports_op must keep
+    // refusing a BF16 op until one exists -- this constructor only decides
+    // what graph shape is well-formed, not what runs.
+    GGML_ASSERT(q->type == k->type && q->type == v->type);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_BF16);
+    GGML_ASSERT(q->nb[0] == ggml_type_size(q->type) &&
+                k->nb[0] == ggml_type_size(k->type) &&
+                v->nb[0] == ggml_type_size(v->type));
     GGML_ASSERT(k->ne[0] == q->ne[0]);            // D
     GGML_ASSERT(v->ne[0] == q->ne[0]);            // DV == D (v1 restriction)
     GGML_ASSERT(v->ne[1] == k->ne[1]);            // S_kv
@@ -5873,8 +5881,14 @@ struct ggml_tensor * ggml_flash_attn_train_back(
         struct ggml_tensor  * fwd,
         struct ggml_tensor  * dfwd,
         float                 scale) {
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float));
+    // S2c: same structural widening as the forward constructor above. The
+    // packed fwd/dfwd gradient buffers stay F32 regardless (spec 3.2/5.2);
+    // only src[0..2]'s own storage type changes.
+    GGML_ASSERT(q->type == k->type && q->type == v->type);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_BF16);
+    GGML_ASSERT(q->nb[0] == ggml_type_size(q->type) &&
+                k->nb[0] == ggml_type_size(k->type) &&
+                v->nb[0] == ggml_type_size(v->type));
     GGML_ASSERT(k->ne[0] == q->ne[0]);
     GGML_ASSERT(v->ne[0] == q->ne[0]);
     GGML_ASSERT(v->ne[1] == k->ne[1]);

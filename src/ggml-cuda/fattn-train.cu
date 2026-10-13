@@ -818,6 +818,16 @@ bool ggml_cuda_flash_attn_train_supported(const ggml_tensor * op) {
     if (!q || !k || !v) {
         return false;
     }
+    // S2c: ggml.c's constructor now also accepts BF16 Q/K/V (same type, all
+    // three), but no BF16 MMA kernel exists in this file yet -- the m16n8k16
+    // fragment map differs from the TF32 kernels' m16n8k8 and still needs to
+    // be derived (RESEARCH/YUE2_S2C_DESIGN.md). Refuse every BF16 operand
+    // here explicitly, rather than let supports_op say yes and dispatch into
+    // a kernel that would read 2-byte BF16 storage as 4-byte float. Flip
+    // this once the BF16 fwd/bwd kernels below actually exist.
+    if (q->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_BF16 || v->type == GGML_TYPE_BF16) {
+        return false;
+    }
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32) {
         return false;
     }
