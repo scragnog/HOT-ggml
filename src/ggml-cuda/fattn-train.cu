@@ -1193,7 +1193,9 @@ static bool fa_train_bf16_supported(const ggml_tensor * op, const int cc) {
         return false;
     }
     for (const ggml_tensor * x : { q, k, v }) {
-        if (x->nb[1] % 4 != 0 || x->nb[2] % 4 != 0 || x->nb[3] % 4 != 0) {
+        // view_offs too: buffer bases are aligned, so a view's data pointer is
+        // only as aligned as its offset, and the launch resolves "none" on it.
+        if (x->nb[1] % 4 != 0 || x->nb[2] % 4 != 0 || x->nb[3] % 4 != 0 || x->view_offs % 4 != 0) {
             return false;
         }
     }
@@ -3351,6 +3353,10 @@ bool ggml_cuda_flash_attn_train_back_supported(const ggml_tensor * op, const int
         return false;
     }
     if (ggml_nelements(fwd) != ggml_flash_attn_train_nelements(op->src[0])) {
+        return false;
+    }
+    // The BF16 backward has no f32 fallback and stages dO with 8-byte loads.
+    if (op->src[0]->type == GGML_TYPE_BF16 && dfwd->view_offs % 8 != 0) {
         return false;
     }
 
