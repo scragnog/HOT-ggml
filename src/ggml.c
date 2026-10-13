@@ -7953,7 +7953,14 @@ void ggml_build_backward_expand(
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
                 continue;
             }
-            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16);
+            // HOT-Step patch: bf16-mul-mat-grad - a BF16 weight operand of
+            // MUL_MAT may carry a gradient.
+            // The YuE2 trainer casts its F32 adapter factors to BF16 for
+            // tensor-core GEMMs (BF16 x BF16, FP32 accumulate); MUL_MAT's
+            // backward writes that operand's gradient in F32 (OUT_PROD) and
+            // the cast's CPY backward hands it to the F32 parameter unchanged.
+            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
+                        (node->src[j]->type == GGML_TYPE_BF16 && node->op == GGML_OP_MUL_MAT && j == 0));
             node_needs_grad = true;
             break;
         }
