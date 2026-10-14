@@ -6,7 +6,8 @@ void ggml_cuda_op_set(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_I32));
-    GGML_ASSERT(src1->type == src0->type);
+    // HOT-Step patch: BF16 set - a BF16 src1 is widened exactly by the BF16->F32 cpy below
+    GGML_ASSERT(src1->type == src0->type || (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16));
     GGML_ASSERT(dst ->type == src0->type);
 
     GGML_ASSERT(ggml_is_contiguous(dst));

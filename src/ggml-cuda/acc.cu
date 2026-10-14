@@ -1,6 +1,9 @@
 #include "acc.cuh"
+#include "convert.cuh" // HOT-Step patch: BF16 acc (ggml_cuda_cast)
 
-static __global__ void acc_f32(const float * x, const float * y, float * dst, const int64_t ne,
+// HOT-Step patch: BF16 acc - x/y may be BF16; widened exactly, then the F32 add.
+template <typename src0_t, typename src1_t>
+static __global__ void acc_f32(const src0_t * x, const src1_t * y, float * dst, const int64_t ne,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset) {
     const int64_t i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -20,14 +23,15 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
     tmp -= i11 * s11;
     const int64_t i10 = tmp;
 
-    float val = x[i];
+    float val = ggml_cuda_cast<float>(x[i]);
     if (src1_idx >= 0 && i10 < ne10 && i11 < ne11 && i12 < ne12 && i13 < ne13) {
-        val += y[((i13*ne12 + i12) * ne11 + i11) * ne10 + i10];
+        val += ggml_cuda_cast<float>(y[((i13*ne12 + i12) * ne11 + i11) * ne10 + i10]);
     }
     dst[i] = val;
 }
 
-static void acc_f32_cuda(const float * x, const float * y, float * dst, const int64_t n_elements,
+template <typename src0_t, typename src1_t>
+static void acc_f32_cuda(const src0_t * x, const src1_t * y, float * dst, const int64_t n_elements,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
     const int num_blocks = (n_elements + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
@@ -38,14 +42,12 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    const float * src0_d = (const float *) src0->data;
-    const float * src1_d = (const float *) src1->data;
     float       * dst_d  = (float       *)  dst->data;
 
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     GGML_ASSERT(ggml_is_contiguous(src1));
@@ -57,5 +59,17 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s3     = dst->op_params[2] / sizeof(float);
     const int64_t offset = dst->op_params[3] / sizeof(float);
 
-    acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
+    const int64_t ne = ggml_nelements(dst);
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const bool x_bf16 = src0->type == GGML_TYPE_BF16;
+    const bool y_bf16 = src1->type == GGML_TYPE_BF16;
+    if (!x_bf16 && !y_bf16) {
+        acc_f32_cuda((const float *) src0->data, (const float *) src1->data, dst_d, ne, ne10, ne11, ne12, ne13, s1, s2, s3, offset, stream);
+    } else if (!x_bf16) {
+        acc_f32_cuda((const float *) src0->data, (const nv_bfloat16 *) src1->data, dst_d, ne, ne10, ne11, ne12, ne13, s1, s2, s3, offset, stream);
+    } else if (!y_bf16) {
+        acc_f32_cuda((const nv_bfloat16 *) src0->data, (const float *) src1->data, dst_d, ne, ne10, ne11, ne12, ne13, s1, s2, s3, offset, stream);
+    } else {
+        acc_f32_cuda((const nv_bfloat16 *) src0->data, (const nv_bfloat16 *) src1->data, dst_d, ne, ne10, ne11, ne12, ne13, s1, s2, s3, offset, stream);
+    }
 }

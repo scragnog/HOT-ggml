@@ -427,9 +427,33 @@ static void ggml_cuda_op_bin_bcast(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
     const void * src0_dd, const void * src1_dd, void * dst_dd, cudaStream_t stream) {
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    // BF16 sources with an F32 dst: the kernels widen each load to float
+    // (exact), so the arithmetic is the F32 path's. REPEAT lands here as
+    // src0 = dst (F32), src1 = the BF16 source.
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+        op()(src0, src1, dst, (const float *) src0_dd, (const nv_bfloat16 *) src1_dd, (float *) dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const nv_bfloat16 *) src1_dd, (float *) dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const float *) src1_dd, (float *) dst_dd, stream);
+    } else if (dst->type == GGML_TYPE_BF16 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) &&
+               (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16)) {
+        // A BF16 dst is a fused bf16_round store: the F32 result is cast once,
+        // round to nearest even, the bits the separate round would store.
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+            op()(src0, src1, dst, (const float *) src0_dd, (const float *) src1_dd, (nv_bfloat16 *) dst_dd, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16) {
+            op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const nv_bfloat16 *) src1_dd, (nv_bfloat16 *) dst_dd, stream);
+        } else if (src0->type == GGML_TYPE_F32) {
+            op()(src0, src1, dst, (const float *) src0_dd, (const nv_bfloat16 *) src1_dd, (nv_bfloat16 *) dst_dd, stream);
+        } else {
+            op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const float *) src1_dd, (nv_bfloat16 *) dst_dd, stream);
+        }
+    } else if (src1->type == GGML_TYPE_BF16) {
+        GGML_ABORT("bin_bcast: unsupported BF16 combination");
+    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
         op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (half *) dst_dd, stream);
@@ -515,9 +539,14 @@ static void bin_round_inputs(ggml_backend_cuda_context & ctx, ggml_tensor * fuse
 
 void ggml_cuda_op_bin_bf16_round_inputs(ggml_backend_cuda_context & ctx, const ggml_tensor * bin, ggml_tensor * dst,
                                         bool round_src0, bool round_src1, bool round_dst) {
-    // As ggml_cuda_op_bin_bf16_round: a copy of bin that writes into dst.
+    // As ggml_cuda_op_bin_bf16_round: a copy of bin that writes into dst
+    // (a BF16 dst is a fused bf16_round store).
     ggml_tensor fused = *bin;
     fused.data = dst->data;
+    fused.type = dst->type;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        fused.nb[k] = dst->nb[k];
+    }
     const int flags = (round_src0 ? 1 : 0) | (round_src1 ? 2 : 0) | (round_dst ? 4 : 0);
     switch (bin->op) {
         case GGML_OP_ADD: bin_round_inputs<op_add>(ctx, &fused, flags); break;
@@ -533,6 +562,11 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    // The branches below cast every src[1..n_fuse] by src1's type: no BF16 here.
+    for (int i = 0; i <= n_fuse; i++) {
+        GGML_ASSERT(dst->src[i]->type != GGML_TYPE_BF16);
+    }
 
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         launch_bin_bcast_pack<op, float, float, float>(src0, src1, dst,
