@@ -26,6 +26,20 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+// BF16_ROUND epilogues: the same F32 result, then the same RNE cast as
+// unary.cu's op_bf16_round, so add + bf16_round fused equals the two launches.
+static __device__ __forceinline__ float op_add_bf16_round(const float a, const float b) {
+    return __bfloat162float(__float2bfloat16(op_add(a, b)));
+}
+
+static __device__ __forceinline__ float op_sub_bf16_round(const float a, const float b) {
+    return __bfloat162float(__float2bfloat16(op_sub(a, b)));
+}
+
+static __device__ __forceinline__ float op_mul_bf16_round(const float a, const float b) {
+    return __bfloat162float(__float2bfloat16(op_mul(a, b)));
+}
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -448,6 +462,26 @@ void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+// bin is an F32 ADD/SUB/MUL, dst the BF16_ROUND of it (same layout): write
+// round(bin) into dst in one launch, without computing bin itself.
+void ggml_cuda_op_bin_bf16_round(ggml_backend_cuda_context & ctx, const ggml_tensor * bin, ggml_tensor * dst) {
+    const ggml_tensor * src0 = bin->src[0];
+    const ggml_tensor * src1 = bin->src[1];
+    switch (bin->op) {
+        case GGML_OP_ADD:
+            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add_bf16_round>>(src0, src1, dst, src0->data, src1->data, dst->data, ctx.stream());
+            break;
+        case GGML_OP_SUB:
+            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_sub_bf16_round>>(src0, src1, dst, src0->data, src1->data, dst->data, ctx.stream());
+            break;
+        case GGML_OP_MUL:
+            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul_bf16_round>>(src0, src1, dst, src0->data, src1->data, dst->data, ctx.stream());
+            break;
+        default:
+            GGML_ABORT("unsupported op for bf16_round fusion");
+    }
 }
 
 template <float (*op)(const float, const float), int n_fuse>

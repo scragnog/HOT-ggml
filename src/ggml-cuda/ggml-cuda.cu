@@ -3650,6 +3650,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // ADD/SUB/MUL whose only consumer is the next node's ggml_bf16_round():
+    // one launch writes the rounded value into the round's output. Same F32
+    // result, same RNE cast; the intermediate is never stored. An input may
+    // share the output's memory only exactly (in place, same layout), since
+    // each thread reads and writes the same element.
+    static const bool disable_bf16_round_fusion = getenv("GGML_CUDA_NO_BF16_ROUND_FUSION") != nullptr;
+    if (!disable_bf16_round_fusion && (node->op == GGML_OP_ADD || node->op == GGML_OP_SUB || node->op == GGML_OP_MUL)) {
+        const ggml_op ops[2] = { node->op, GGML_OP_UNARY };
+        if (ggml_can_fuse(cgraph, i, ops, 2)) {
+            ggml_tensor * rnd = cgraph->nodes[i + 1];
+            const ggml_tensor * src0 = node->src[0];
+            const ggml_tensor * src1 = node->src[1];
+            auto alias_ok = [rnd](const ggml_tensor * src) {
+                const char * s = (const char *) src->data;
+                const char * d = (const char *) rnd->data;
+                if (s == d) {
+                    return ggml_are_same_layout(src, rnd);
+                }
+                return s + ggml_nbytes(src) <= d || d + ggml_nbytes(rnd) <= s;
+            };
+            if (ggml_get_unary_op(rnd) == GGML_UNARY_OP_BF16_ROUND && rnd->src[0] == node &&
+                node->type == GGML_TYPE_F32 && rnd->type == GGML_TYPE_F32 &&
+                src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                ggml_are_same_layout(node, rnd) && alias_ok(src0) && alias_ok(src1)) {
+                ggml_cuda_op_bin_bf16_round(*cuda_ctx, node, rnd);
+                return 1;
+            }
+        }
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
