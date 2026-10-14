@@ -6431,6 +6431,20 @@ struct ggml_tensor * ggml_bf16_round(struct ggml_context * ctx, struct ggml_tens
     if (!ggml_is_contiguous(a)) {
         a = ggml_cont(ctx, a);
     }
+    // A round of a value that is already a BF16_ROUND output changes nothing in
+    // forward, but its backward still rounds this edge's gradient before fan-in,
+    // so the node stays. It runs in place and op_params[1] marks it, so a backend
+    // may skip the launch (CUDA does): it would rewrite the same bits.
+    // GGML_NO_BF16_ROUND_INPLACE=1 turns this off.
+    static int inplace = -1;
+    if (inplace < 0) {
+        inplace = getenv("GGML_NO_BF16_ROUND_INPLACE") == NULL;
+    }
+    if (inplace && ggml_is_bf16_rounded(a)) {
+        struct ggml_tensor * result = ggml_unary_impl(ctx, a, GGML_UNARY_OP_BF16_ROUND, true);
+        ggml_set_op_params_i32(result, 1, 1);
+        return result;
+    }
     return ggml_unary(ctx, a, GGML_UNARY_OP_BF16_ROUND);
 }
 
@@ -8005,9 +8019,12 @@ void ggml_build_backward_expand(
             continue;
         }
 
-        // inplace operations are currently not supported
+        // inplace operations are currently not supported, except ggml_bf16_round()'s
+        // round of an already-rounded value, whose backward never reads its output
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
+            (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_BF16_ROUND &&
+             ggml_get_op_params_i32(node, 1) == 1));
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);

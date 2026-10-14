@@ -2213,6 +2213,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_trunc(ctx, dst);
                     break;
                 case GGML_UNARY_OP_BF16_ROUND:
+                    // ggml_bf16_round() marks a round of an already-rounded
+                    // value and makes it in place: nothing to write.
+                    if (ggml_get_op_params_i32(dst, 1) == 1 && dst->data == dst->src[0]->data) {
+                        break;
+                    }
                     ggml_cuda_op_bf16_round(ctx, dst);
                     break;
                 case GGML_UNARY_OP_EXPM1:
