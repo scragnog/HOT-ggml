@@ -6415,6 +6415,16 @@ struct ggml_tensor * ggml_unary(
     return ggml_unary_impl(ctx, a, op, false);
 }
 
+// True when every value of t is an unchanged BF16_ROUND output, read through
+// views, reshapes, permutes or a cont copy.
+static bool ggml_is_bf16_rounded(const struct ggml_tensor * t) {
+    while (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+           t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_CONT) {
+        t = t->src[0];
+    }
+    return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_BF16_ROUND;
+}
+
 struct ggml_tensor * ggml_bf16_round(struct ggml_context * ctx, struct ggml_tensor * a) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     // The CPU/CUDA kernels are contiguous F32 elementwise operations.
@@ -7635,7 +7645,17 @@ static void ggml_compute_backward(
         case GGML_OP_UNARY: {
             if (ggml_get_unary_op(tensor) == GGML_UNARY_OP_BF16_ROUND) {
                 if (src0_needs_grads) {
-                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_bf16_round(ctx, grad));
+                    // Rounding is idempotent (an RNE cast of a bf16-exact value, or of
+                    // the canonical NaN, returns it unchanged), so a grad that already
+                    // comes from a round passes through. Only here, not in
+                    // ggml_bf16_round(): a forward round's backward rounds its own grad
+                    // branch before the branches are summed.
+                    static int elide = -1;
+                    if (elide < 0) {
+                        elide = getenv("GGML_NO_BF16_ROUND_ELIDE") == NULL;
+                    }
+                    const bool rounded = elide && ggml_is_contiguous(grad) && ggml_is_bf16_rounded(grad);
+                    ggml_add_or_set(ctx, cgraph, isrc0, rounded ? grad : ggml_bf16_round(ctx, grad));
                 }
                 break;
             }
