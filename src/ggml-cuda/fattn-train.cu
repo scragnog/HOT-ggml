@@ -864,6 +864,22 @@ fa_train_fwd_tf32(
 // ldmatrix phase, and the 8 key rows of the QK B read (word 68g + 8ks + t +
 // 4r, bank 4g + t + ...), on distinct banks.
 
+// The causal and kv_grad_start hints (ggml.h) for the BF16 kernels. A true
+// hint changes no result: the causal path computes the mask's own 0/-INF
+// values and skips exactly the tiles the mask scan would, in the same order,
+// and kv_grad_start only drops dK/dV rows nobody reads.
+// GGML_CUDA_FA_TRAIN_NO_HINTS=1 reads the mask and computes every row again.
+static bool fa_train_hints_off() {
+    static const bool off = getenv("GGML_CUDA_FA_TRAIN_NO_HINTS") != nullptr;
+    return off;
+}
+static int64_t fa_train_causal_hint(const ggml_tensor * op) {
+    return (fa_train_hints_off() || !op->src[3]) ? -1 : ggml_flash_attn_train_get_causal(op);
+}
+static int64_t fa_train_kv_grad_start(const ggml_tensor * op) {
+    return fa_train_hints_off() ? 0 : ggml_flash_attn_train_get_kv_grad_start(op);
+}
+
 #define FA_TRAIN_BF16_NW 4                       // warps per block
 #define FA_TRAIN_BF16_BQ (FA_TRAIN_BF16_NW*16)   // queries per block
 #define FA_TRAIN_BF16_BK 64                      // keys per tile = four PV k-slices
@@ -915,7 +931,7 @@ fa_train_fwd_bf16(
         const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3,
         const int64_t mne0, const int64_t mne1, const int64_t mne2, const int64_t mne3,
         const int64_t S, const int64_t S_kv, const int64_t Nh, const int64_t G,
-        const float scale) {
+        const float scale, const int64_t causal) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int NW  = FA_TRAIN_BF16_NW;
     constexpr int BK  = FA_TRAIN_BF16_BK;
@@ -995,7 +1011,16 @@ fa_train_fwd_bf16(
         const half * mc_t = mrow_c ? mrow_c + j0 : nullptr;
 
         // Tile liveness, then ONE barrier that both publishes it and fences the
-        // previous tile's K/V reads (the TF32 kernel's merged barrier).
+        // previous tile's K/V reads (the TF32 kernel's merged barrier). With the
+        // causal hint the mask is never read: key j is live for row i iff
+        // j <= causal + i, so the live tiles are a prefix of the sweep.
+        if (causal >= 0) {
+            const int64_t qlast = min((int64_t) blockIdx.x*FA_TRAIN_BF16_BQ + FA_TRAIN_BF16_BQ - 1, S - 1);
+            if (j0 > causal + qlast) {
+                break;
+            }
+            __syncthreads();
+        } else {
         bool anylive = false;
 #pragma unroll
         for (int nb = 0; nb < NNB; ++nb) {
@@ -1011,6 +1036,7 @@ fa_train_fwd_bf16(
         }
         if (!__syncthreads_or(anylive)) {
             continue;
+        }
         }
 
         // Stage K and V row-major, one 4-byte BF16 pair per thread per row;
@@ -1064,7 +1090,11 @@ fa_train_fwd_bf16(
                 const bool   ok  = (l < 2) ? oka : okc;
                 float mv = -INFINITY;
                 if (ok && col < nk) {
-                    mv = mr ? __half2float(mr[col]) : 0.0f;
+                    if (causal >= 0) {
+                        mv = (j0 + col <= causal + ((l < 2) ? ia : ic)) ? 0.0f : -INFINITY;
+                    } else {
+                        mv = mr ? __half2float(mr[col]) : 0.0f;
+                    }
                 }
                 const float s = fa_tf32::score(sacc[nb][l], scale, mv);
                 sacc[nb][l]   = s;
@@ -1359,7 +1389,7 @@ void ggml_cuda_flash_attn_train(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
                 (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
                 (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
-                mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);
+                mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale, fa_train_causal_hint(dst));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -2788,7 +2818,7 @@ fa_train_bwd_dq_bf16(
         const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3,
         const int64_t mne0, const int64_t mne1, const int64_t mne2, const int64_t mne3,
         const int64_t S, const int64_t S_kv, const int64_t Nh, const int64_t G,
-        const float scale) {
+        const float scale, const int64_t causal) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int NW  = FA_TRAIN_BF16_DQ_NW;
     constexpr int BQ  = FA_TRAIN_BF16_DQ_BQ;
@@ -2897,7 +2927,14 @@ fa_train_bwd_dq_bf16(
         mbuf ^= 1;
 
         // Coalesced BQ x BK liveness scan, which also fills msh (-INF out of
-        // range); its barrier also fences the previous tile's K/V reads.
+        // range); its barrier also fences the previous tile's K/V reads. The
+        // causal hint replaces the scan, as in the forward.
+        if (causal >= 0) {
+            if (j0 > causal + min(qb0 + BQ - 1, S - 1)) {
+                break;
+            }
+            __syncthreads();
+        } else {
         bool anylive = (mask == nullptr);
         if (mask) {
             const half * mtile = mtile0 + j0;
@@ -2916,6 +2953,7 @@ fa_train_bwd_dq_bf16(
         }
         if (!__syncthreads_or(anylive)) {
             continue;
+        }
         }
 
         {
@@ -2967,7 +3005,10 @@ fa_train_bwd_dq_bf16(
             for (int l = 0; l < 4; ++l) {
                 const int col = 8*nb + 2*t + (l%2);
                 float mv;
-                if (mask) {
+                if (causal >= 0) {
+                    mv = (((l < 2) ? oka : okc) && col < nk &&
+                          j0 + col <= causal + ((l < 2) ? ia : ic)) ? 0.0f : -INFINITY;
+                } else if (mask) {
                     mv = __half2float(msh[(16*w + g + 8*(l/2))*MS + col]);
                 } else {
                     mv = (((l < 2) ? oka : okc) && col < nk) ? 0.0f : -INFINITY;
@@ -3054,7 +3095,8 @@ fa_train_bwd_dkdv_bf16(
         const int64_t mne0, const int64_t mne1, const int64_t mne2, const int64_t mne3,
         const int64_t S, const int64_t S_kv, const int64_t Nh, const int64_t Nkv,
         const int64_t G, const float scale,
-        const int GS, const int64_t part_stride) {
+        const int GS, const int64_t part_stride,
+        const int64_t causal, const int64_t kv0) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int DH  = FA_TRAIN_BF16_DKDV_DH;
     constexpr int NW  = FA_TRAIN_BF16_DKDV_NW;
@@ -3106,9 +3148,13 @@ fa_train_bwd_dkdv_bf16(
 
     const int mstride = (int) mne0;
 
+    // kv_grad_start: rows below kv0 are a detached prefix whose gradient
+    // nobody reads. A block entirely below it writes its zeros and stops.
+    const bool skip = j0b + BJ <= kv0;
+
     // The block's BJ K/V rows, resident for the whole sweep; rows past S_kv
     // are zero. Published by the first tile's barrier.
-    {
+    if (!skip) {
         const int jj0 = tid/WPR;
         const int wd  = tid%WPR;
 #pragma unroll
@@ -3136,7 +3182,7 @@ fa_train_bwd_dkdv_bf16(
     }
 
     int mbuf = 0;   // msh parity runs across heads: a reset could reuse a buffer still being read
-    for (int64_t g = gbeg; g < gbeg + gper; ++g) {
+    for (int64_t g = skip ? gbeg + gper : gbeg; g < gbeg + gper; ++g) {
         const int64_t h  = hk*G + g;
         const char  * qh = q_base + h*q_nb2 + b*q_nb3;
         const int64_t rh = h + Nh*S*b;                   // + Nh*i
@@ -3152,7 +3198,14 @@ fa_train_bwd_dkdv_bf16(
             mbuf ^= 1;
 
             // Coalesced BJ x BI liveness scan; the barrier also fences the
-            // previous tile's Q/dO reads.
+            // previous tile's Q/dO reads. The causal hint replaces the scan:
+            // the tile is live iff its first key j0b <= causal + its last row.
+            if (causal >= 0) {
+                if (j0b > causal + (i0 + ni - 1)) {
+                    continue;
+                }
+                __syncthreads();
+            } else {
             bool anylive = (mask == nullptr);
             if (mask) {
                 const half * mtile = mhb + j0b + mne0*i0;
@@ -3173,6 +3226,7 @@ fa_train_bwd_dkdv_bf16(
             }
             if (!__syncthreads_or(anylive)) {
                 continue;
+            }
             }
 
             // Stage Q (BF16 words) and dO (f32 pairs rounded to BF16 once),
@@ -3257,7 +3311,10 @@ fa_train_bwd_dkdv_bf16(
                 for (int l = 0; l < 4; ++l) {
                     const int ql = 8*nb + 2*t4 + (l%2);
                     float mv;
-                    if (mask) {
+                    if (causal >= 0) {
+                        mv = (((l < 2) ? oka : okc) && ql < ni &&
+                              j0b + krow + g4 + 8*(l/2) <= causal + (i0 + ql)) ? 0.0f : -INFINITY;
+                    } else if (mask) {
                         mv = __half2float(msh[ql*MS + krow + g4 + 8*(l/2)]);
                     } else {
                         mv = (((l < 2) ? oka : okc) && ql < ni) ? 0.0f : -INFINITY;
@@ -3515,7 +3572,8 @@ void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tenso
                 (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
                 (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
                 (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
-                mne0, mne1, mne2, mne3, S, S_kv, Nh, Nkv, G, scale, GS, part_stride);
+                mne0, mne1, mne2, mne3, S, S_kv, Nh, Nkv, G, scale, GS, part_stride,
+                fa_train_causal_hint(dst), fa_train_kv_grad_start(dst));
         if (GS > 1) {
             const int64_t nthr = 256;
             const dim3    grid_sum((unsigned) ((n_kv_el + nthr - 1)/nthr), 1, 1);
@@ -3530,7 +3588,7 @@ void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tenso
                 (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
                 (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
                 (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
-                mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale);
+                mne0, mne1, mne2, mne3, S, S_kv, Nh, G, scale, fa_train_causal_hint(dst));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
