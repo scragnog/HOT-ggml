@@ -467,17 +467,21 @@ void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // bin is an F32 ADD/SUB/MUL, dst the BF16_ROUND of it (same layout): write
 // round(bin) into dst in one launch, without computing bin itself.
 void ggml_cuda_op_bin_bf16_round(ggml_backend_cuda_context & ctx, const ggml_tensor * bin, ggml_tensor * dst) {
+    // The launcher reads src1 through dst->src[1], so run on a copy of bin
+    // that writes into dst's memory (same layout, checked by the caller).
+    ggml_tensor fused = *bin;
+    fused.data = dst->data;
     const ggml_tensor * src0 = bin->src[0];
     const ggml_tensor * src1 = bin->src[1];
     switch (bin->op) {
         case GGML_OP_ADD:
-            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add_bf16_round>>(src0, src1, dst, src0->data, src1->data, dst->data, ctx.stream());
+            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add_bf16_round>>(src0, src1, &fused, src0->data, src1->data, fused.data, ctx.stream());
             break;
         case GGML_OP_SUB:
-            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_sub_bf16_round>>(src0, src1, dst, src0->data, src1->data, dst->data, ctx.stream());
+            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_sub_bf16_round>>(src0, src1, &fused, src0->data, src1->data, fused.data, ctx.stream());
             break;
         case GGML_OP_MUL:
-            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul_bf16_round>>(src0, src1, dst, src0->data, src1->data, dst->data, ctx.stream());
+            ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul_bf16_round>>(src0, src1, &fused, src0->data, src1->data, fused.data, ctx.stream());
             break;
         default:
             GGML_ABORT("unsupported op for bf16_round fusion");
