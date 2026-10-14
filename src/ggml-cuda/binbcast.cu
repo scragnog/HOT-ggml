@@ -488,6 +488,45 @@ void ggml_cuda_op_bin_bf16_round(ggml_backend_cuda_context & ctx, const ggml_ten
     }
 }
 
+// The same op with the deferred BF16_ROUND of each flagged input applied as it
+// is loaded (ggml-cuda.cu skipped that launch), and optionally the output round.
+template <float (*bin_op)(const float, const float), bool round_a, bool round_b, bool round_out>
+static __device__ __forceinline__ float op_bin_round_inputs(const float a, const float b) {
+    const float x = bin_op(round_a ? __bfloat162float(__float2bfloat16(a)) : a,
+                           round_b ? __bfloat162float(__float2bfloat16(b)) : b);
+    return round_out ? __bfloat162float(__float2bfloat16(x)) : x;
+}
+
+template <float (*bin_op)(const float, const float)>
+static void bin_round_inputs(ggml_backend_cuda_context & ctx, ggml_tensor * fused, int flags) {
+    const ggml_tensor * s0 = fused->src[0];
+    const ggml_tensor * s1 = fused->src[1];
+    cudaStream_t st = ctx.stream();
+    switch (flags) {
+        case 1: ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_bin_round_inputs<bin_op, true,  false, false>>>(s0, s1, fused, s0->data, s1->data, fused->data, st); break;
+        case 2: ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_bin_round_inputs<bin_op, false, true,  false>>>(s0, s1, fused, s0->data, s1->data, fused->data, st); break;
+        case 3: ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_bin_round_inputs<bin_op, true,  true,  false>>>(s0, s1, fused, s0->data, s1->data, fused->data, st); break;
+        case 5: ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_bin_round_inputs<bin_op, true,  false, true>>>(s0, s1, fused, s0->data, s1->data, fused->data, st); break;
+        case 6: ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_bin_round_inputs<bin_op, false, true,  true>>>(s0, s1, fused, s0->data, s1->data, fused->data, st); break;
+        case 7: ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_bin_round_inputs<bin_op, true,  true,  true>>>(s0, s1, fused, s0->data, s1->data, fused->data, st); break;
+        default: GGML_ABORT("deferred bf16_round: no input to round");
+    }
+}
+
+void ggml_cuda_op_bin_bf16_round_inputs(ggml_backend_cuda_context & ctx, const ggml_tensor * bin, ggml_tensor * dst,
+                                        bool round_src0, bool round_src1, bool round_dst) {
+    // As ggml_cuda_op_bin_bf16_round: a copy of bin that writes into dst.
+    ggml_tensor fused = *bin;
+    fused.data = dst->data;
+    const int flags = (round_src0 ? 1 : 0) | (round_src1 ? 2 : 0) | (round_dst ? 4 : 0);
+    switch (bin->op) {
+        case GGML_OP_ADD: bin_round_inputs<op_add>(ctx, &fused, flags); break;
+        case GGML_OP_SUB: bin_round_inputs<op_sub>(ctx, &fused, flags); break;
+        case GGML_OP_MUL: bin_round_inputs<op_mul>(ctx, &fused, flags); break;
+        default: GGML_ABORT("unsupported op for deferred bf16_round");
+    }
+}
+
 template <float (*op)(const float, const float), int n_fuse>
 static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();

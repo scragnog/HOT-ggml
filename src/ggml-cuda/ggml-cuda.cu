@@ -96,6 +96,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -3486,6 +3487,93 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// ADD/SUB/MUL whose only consumer is the next node's ggml_bf16_round():
+// one launch writes the rounded value into the round's output. Same F32
+// result, same RNE cast; the intermediate is never stored. An input may
+// share the output's memory only exactly (in place, same layout), since
+// each thread reads and writes the same element. Returns that round, or
+// nullptr when node i cannot take it.
+static ggml_tensor * ggml_cuda_bf16_round_fusion_target(ggml_cgraph * cgraph, int i) {
+    static const bool disable_bf16_round_fusion = getenv("GGML_CUDA_NO_BF16_ROUND_FUSION") != nullptr;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (disable_bf16_round_fusion || !(node->op == GGML_OP_ADD || node->op == GGML_OP_SUB || node->op == GGML_OP_MUL)) {
+        return nullptr;
+    }
+    const ggml_op ops[2] = { node->op, GGML_OP_UNARY };
+    if (!ggml_can_fuse(cgraph, i, ops, 2)) {
+        return nullptr;
+    }
+    ggml_tensor * rnd = cgraph->nodes[i + 1];
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    auto alias_ok = [rnd](const ggml_tensor * src) {
+        const char * s = (const char *) src->data;
+        const char * d = (const char *) rnd->data;
+        if (s == d) {
+            return ggml_are_same_layout(src, rnd);
+        }
+        return s + ggml_nbytes(src) <= d || d + ggml_nbytes(rnd) <= s;
+    };
+    if (ggml_get_unary_op(rnd) == GGML_UNARY_OP_BF16_ROUND && rnd->src[0] == node &&
+        node->type == GGML_TYPE_F32 && rnd->type == GGML_TYPE_F32 &&
+        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+        ggml_are_same_layout(node, rnd) && alias_ok(src0) && alias_ok(src1)) {
+        return rnd;
+    }
+    return nullptr;
+}
+
+static int32_t ggml_cuda_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t h = ggml_hash_find(&cgraph->visited_hash_set, t);
+    return ggml_bitset_get(cgraph->visited_hash_set.used, h) ? cgraph->use_counts[h] : -1;
+}
+
+// A BF16_ROUND that runs in place on an F32 node whose only reader is that
+// round, and whose own only reader is an ADD/SUB/MUL: the round launch is
+// skipped and the ADD/SUB/MUL rounds that input as it loads it. Same RNE cast
+// of the same F32 value, one read+write pass fewer. plan[j] = 1 marks a
+// skipped round; for its reader, bit 2 rounds src0 and bit 4 src1.
+// GGML_CUDA_NO_BF16_ROUND_DEFER=1 turns this off.
+static void ggml_cuda_plan_deferred_rounds(const ggml_cgraph * cgraph, std::vector<uint8_t> & plan) {
+    static const bool disable = getenv("GGML_CUDA_NO_BF16_ROUND_DEFER") != nullptr;
+    plan.assign(cgraph->n_nodes, 0);
+    if (disable) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> rounds;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * r = cgraph->nodes[j];
+        const ggml_tensor * x = r->src[0];
+        if (r->op == GGML_OP_UNARY && ggml_get_unary_op(r) == GGML_UNARY_OP_BF16_ROUND &&
+            ggml_get_op_params_i32(r, 1) != 1 && (r->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            !(r->flags & GGML_TENSOR_FLAG_OUTPUT) && r->type == GGML_TYPE_F32 && !r->view_src &&
+            x->type == GGML_TYPE_F32 && x->op != GGML_OP_NONE && !x->view_src &&
+            !(x->flags & GGML_TENSOR_FLAG_OUTPUT) && r->data == x->data &&
+            ggml_are_same_layout(r, x) && ggml_is_contiguous(r) &&
+            ggml_cuda_use_count(cgraph, r) == 1 && ggml_cuda_use_count(cgraph, x) == 1) {
+            rounds.emplace(r, j);
+        }
+    }
+    if (rounds.empty()) {
+        return;
+    }
+    for (int k = 0; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (!(n->op == GGML_OP_ADD || n->op == GGML_OP_SUB || n->op == GGML_OP_MUL) ||
+            !(n->flags & GGML_TENSOR_FLAG_COMPUTE) || n->type != GGML_TYPE_F32 ||
+            n->src[0]->type != GGML_TYPE_F32 || n->src[1]->type != GGML_TYPE_F32) {
+            continue;
+        }
+        for (int s = 0; s < 2; ++s) {
+            auto it = rounds.find(n->src[s]);
+            if (it != rounds.end() && it->second < k) {
+                plan[it->second] = 1;
+                plan[k] |= s == 0 ? 2 : 4;
+            }
+        }
+    }
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3655,34 +3743,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // ADD/SUB/MUL whose only consumer is the next node's ggml_bf16_round():
-    // one launch writes the rounded value into the round's output. Same F32
-    // result, same RNE cast; the intermediate is never stored. An input may
-    // share the output's memory only exactly (in place, same layout), since
-    // each thread reads and writes the same element.
-    static const bool disable_bf16_round_fusion = getenv("GGML_CUDA_NO_BF16_ROUND_FUSION") != nullptr;
-    if (!disable_bf16_round_fusion && (node->op == GGML_OP_ADD || node->op == GGML_OP_SUB || node->op == GGML_OP_MUL)) {
-        const ggml_op ops[2] = { node->op, GGML_OP_UNARY };
-        if (ggml_can_fuse(cgraph, i, ops, 2)) {
-            ggml_tensor * rnd = cgraph->nodes[i + 1];
-            const ggml_tensor * src0 = node->src[0];
-            const ggml_tensor * src1 = node->src[1];
-            auto alias_ok = [rnd](const ggml_tensor * src) {
-                const char * s = (const char *) src->data;
-                const char * d = (const char *) rnd->data;
-                if (s == d) {
-                    return ggml_are_same_layout(src, rnd);
-                }
-                return s + ggml_nbytes(src) <= d || d + ggml_nbytes(rnd) <= s;
-            };
-            if (ggml_get_unary_op(rnd) == GGML_UNARY_OP_BF16_ROUND && rnd->src[0] == node &&
-                node->type == GGML_TYPE_F32 && rnd->type == GGML_TYPE_F32 &&
-                src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                ggml_are_same_layout(node, rnd) && alias_ok(src0) && alias_ok(src1)) {
-                ggml_cuda_op_bin_bf16_round(*cuda_ctx, node, rnd);
-                return 1;
-            }
-        }
+    if (ggml_tensor * rnd = ggml_cuda_bf16_round_fusion_target(cgraph, i)) {
+        ggml_cuda_op_bin_bf16_round(*cuda_ctx, node, rnd);
+        return 1;
     }
 
     // multi-(add or mul)
@@ -4369,6 +4432,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // Deferred rounds stay off with concurrent streams: a skipped round
+            // and its reader must run in order on one stream.
+            std::vector<uint8_t> deferred_rounds;
+            if (stream_ctx.concurrent_events.empty()) {
+                ggml_cuda_plan_deferred_rounds(cgraph, deferred_rounds);
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4411,7 +4481,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (!deferred_rounds.empty() && deferred_rounds[i]) {
+                    if (deferred_rounds[i] == 1) {
+                        continue;  // its reader rounds on load
+                    }
+                    ggml_tensor * rnd = ggml_cuda_bf16_round_fusion_target(cgraph, i);
+                    ggml_cuda_op_bin_bf16_round_inputs(*cuda_ctx, node, rnd ? rnd : node,
+                                                       deferred_rounds[i] & 2, deferred_rounds[i] & 4, rnd != nullptr);
+                    i += rnd ? 1 : 0;
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                // A reader of a skipped round must run through the branch above.
+                for (int k = 1; k <= nodes_to_skip && !deferred_rounds.empty(); ++k) {
+                    if (deferred_rounds[i + k] & 6) {
+                        GGML_ABORT("a fusion absorbed the reader of a deferred bf16 round; set GGML_CUDA_NO_BF16_ROUND_DEFER=1");
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
