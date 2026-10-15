@@ -3743,6 +3743,12 @@ static ggml_tensor * ggml_cuda_bf16_producer_store_target(ggml_cgraph * cgraph, 
     const char * d = (const char *) rnd->data;
     for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
         const char * a = (const char *) node->src[s]->data;
+        // In place over a BF16 input of the same layout is safe: each thread
+        // writes only elements it has read itself, and the norms finish their
+        // row reduction before they write.
+        if (a == d && ggml_are_same_layout(node->src[s], rnd)) {
+            continue;
+        }
         if (!(a + ggml_nbytes(node->src[s]) <= d || d + ggml_nbytes(rnd) <= a)) {
             return nullptr;
         }
