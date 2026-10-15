@@ -155,6 +155,9 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         unary_cuda<op>((const nv_bfloat16 *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
     } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
         unary_cuda<op>((const float *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+    } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+        // a fused BF16 round store (ggml_cuda_bf16_producer_store_target)
+        unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
     } else {
         GGML_ABORT("unsupported unary types");
     }
@@ -604,7 +607,6 @@ void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
-    float       * dst_d  = (float       *) dst->data;
 
     cudaStream_t stream = ctx.stream();
 
@@ -612,18 +614,26 @@ void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     const int k = ggml_nelements(src0);
 
+    // BF16 dst: a fused BF16 round store (ggml_cuda_bf16_producer_store_target)
+    auto launch = [&](auto * dst_d) {
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+            silu_back_cuda((const float*)src0_d, (const float*)src1_d, dst_d, k, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16) {
+            silu_back_cuda((const nv_bfloat16 *)src0_d, (const nv_bfloat16 *)src1_d, dst_d, k, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32) {
+            silu_back_cuda((const nv_bfloat16 *)src0_d, (const float *)src1_d, dst_d, k, stream);
+        } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16) {
+            silu_back_cuda((const float *)src0_d, (const nv_bfloat16 *)src1_d, dst_d, k, stream);
+        } else {
+            GGML_ABORT("unsupported silu_back types");
+        }
+    };
     if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
-        silu_back_cuda((const half *)src0_d, (const half *)src1_d, (half *)dst_d, k, stream);
-    } else if (dst->type != GGML_TYPE_F32) {
-        GGML_ABORT("unsupported silu_back types");
-    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
-        silu_back_cuda((const float*)src0_d, (const float*)src1_d, (float *)dst_d, k, stream);
-    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16) {
-        silu_back_cuda((const nv_bfloat16 *)src0_d, (const nv_bfloat16 *)src1_d, (float *)dst_d, k, stream);
-    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32) {
-        silu_back_cuda((const nv_bfloat16 *)src0_d, (const float *)src1_d, (float *)dst_d, k, stream);
-    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16) {
-        silu_back_cuda((const float *)src0_d, (const nv_bfloat16 *)src1_d, (float *)dst_d, k, stream);
+        silu_back_cuda((const half *)src0_d, (const half *)src1_d, (half *)dst->data, k, stream);
+    } else if (dst->type == GGML_TYPE_F32) {
+        launch((float *) dst->data);
+    } else if (dst->type == GGML_TYPE_BF16) {
+        launch((nv_bfloat16 *) dst->data);
     } else {
         GGML_ABORT("unsupported silu_back types");
     }

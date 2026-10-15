@@ -3699,6 +3699,57 @@ static ggml_tensor * ggml_cuda_gemm_bf16_store_target(ggml_backend_cuda_context 
     return rnd;
 }
 
+// BF16 activation storage: an RMS_NORM, RMS_NORM_BACK, SILU, SILU_BACK or NeoX
+// ROPE whose only reader is the next node's F32 -> BF16 ggml_bf16_round()
+// store writes that BF16 value itself. Same F32 result, same round-to-nearest-
+// even cast, in the producer's registers; the F32 intermediate is never
+// written. GGML_CUDA_NO_BF16_PRODUCER_STORE=1 turns this off.
+static ggml_tensor * ggml_cuda_bf16_producer_store_target(ggml_cgraph * cgraph, int i) {
+    static const bool disable = getenv("GGML_CUDA_NO_BF16_PRODUCER_STORE") != nullptr;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (disable || node->type != GGML_TYPE_F32 || i + 1 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    switch (node->op) {
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_RMS_NORM_BACK:
+        case GGML_OP_SILU_BACK:
+            break;
+        case GGML_OP_UNARY:
+            if (ggml_get_unary_op(node) != GGML_UNARY_OP_SILU) {
+                return nullptr;
+            }
+            break;
+        case GGML_OP_ROPE: {
+            const int mode = ((const int32_t *) node->op_params)[2];
+            if (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) || node->src[0]->type != GGML_TYPE_F32) {
+                return nullptr;
+            }
+            break;
+        }
+        default:
+            return nullptr;
+    }
+    ggml_tensor * rnd = cgraph->nodes[i + 1];
+    if (rnd->op != GGML_OP_UNARY || ggml_get_unary_op(rnd) != GGML_UNARY_OP_BF16_ROUND || rnd->src[0] != node ||
+        rnd->type != GGML_TYPE_BF16 || rnd->view_src || !ggml_are_same_shape(node, rnd) ||
+        !ggml_is_contiguous(node) || !ggml_is_contiguous(rnd)) {
+        return nullptr;
+    }
+    const ggml_op ops[2] = { node->op, GGML_OP_UNARY };
+    if (!ggml_can_fuse(cgraph, i, ops, 2)) {
+        return nullptr;
+    }
+    const char * d = (const char *) rnd->data;
+    for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+        const char * a = (const char *) node->src[s]->data;
+        if (!(a + ggml_nbytes(node->src[s]) <= d || d + ggml_nbytes(rnd) <= a)) {
+            return nullptr;
+        }
+    }
+    return rnd;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3718,6 +3769,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fused.nb[k] = rnd->nb[k];
         }
         ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(*cuda_ctx, node->src[0], node->src[1], &fused);
+        return 1;
+    }
+
+    if (ggml_tensor * rnd = ggml_cuda_bf16_producer_store_target(cgraph, i)) {
+        ggml_tensor fused = *node;
+        fused.type   = rnd->type;
+        fused.data   = rnd->data;
+        fused.buffer = rnd->buffer;
+        for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+            fused.nb[k] = rnd->nb[k];
+        }
+        ggml_cuda_compute_forward(*cuda_ctx, &fused);
         return 1;
     }
 
