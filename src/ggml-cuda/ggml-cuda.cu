@@ -3722,7 +3722,8 @@ static ggml_tensor * ggml_cuda_bf16_producer_store_target(ggml_cgraph * cgraph, 
             break;
         case GGML_OP_ROPE: {
             const int mode = ((const int32_t *) node->op_params)[2];
-            if (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) || node->src[0]->type != GGML_TYPE_F32) {
+            if (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) ||
+                !(node->src[0]->type == GGML_TYPE_F32 || node->src[0]->type == GGML_TYPE_BF16)) {
                 return nullptr;
             }
             break;
@@ -5972,6 +5973,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return false;
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
+            // a BF16 src0 only for plain NeoX (BF16 activation storage)
+            const int mode = ((const int32_t *) op->op_params)[2];
+            if (op->src[0]->type == GGML_TYPE_BF16 &&
+                (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) || op->type != GGML_TYPE_F32)) {
+                return false;
+            }
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
         case GGML_OP_IM2COL:

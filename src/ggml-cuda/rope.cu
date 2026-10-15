@@ -557,13 +557,15 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     }
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
     // When not fused, src0 and dst types must match
     // When fused (ROPE+VIEW+SET_ROWS), src0 may be F32 and dst may be F16
-    // When fused with a BF16 round store (NeoX only), src0 is F32 and dst BF16
+    // BF16 activation storage (NeoX only): a BF16 src0, and a BF16 dst when
+    // fused with a BF16 round store
     GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
-                (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16));
+                (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) ||
+                (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32));
 
     const int64_t ne00 = src0->ne[0]; // head dims
     const int64_t ne01 = src0->ne[1]; // num heads
@@ -652,6 +654,17 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                         s01, s02, s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale,
                                                         freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
                                                         row_indices, set_rows_stride, inplace, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_F32) {
+            rope_neox_cuda<forward, nv_bfloat16, float>((const nv_bfloat16 *) src0_d, (float *) dst_d, ne00, ne01, ne02,
+                                                        s01, s02, s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale,
+                                                        freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
+                                                        row_indices, set_rows_stride, inplace, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_BF16) {
+            // a BF16 source and a fused BF16 round store
+            rope_neox_cuda<forward, nv_bfloat16, nv_bfloat16>((const nv_bfloat16 *) src0_d, (nv_bfloat16 *) dst_d, ne00, ne01,
+                                                              ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, nr, pos,
+                                                              freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                                                              freq_factors, row_indices, set_rows_stride, inplace, stream);
         } else {
             GGML_ABORT("fatal error");
         }
