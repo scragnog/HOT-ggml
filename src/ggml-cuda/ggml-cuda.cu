@@ -1547,7 +1547,14 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
 
-    if (prefer_f32_output) {
+    if (compute_type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+        // BF16 GEMM store (ggml_cuda_gemm_bf16_store_target): FP32 accumulate,
+        // cuBLAS rounds the result to BF16 as it writes it.
+        dst_ptr = (char *) dst->data;
+        cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
+        alpha = batched_mul_mat_traits<GGML_TYPE_F32>::get_alpha();
+        beta = batched_mul_mat_traits<GGML_TYPE_F32>::get_beta();
+    } else if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
         cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
         cu_data_type = batched_mul_mat_traits<GGML_TYPE_F32>::data_type;
@@ -1646,7 +1653,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 
     // Convert output back to F32 if needed
-    if (cu_data_type != CUDA_R_32F) {
+    if (cu_data_type != CUDA_R_32F && dst->type == GGML_TYPE_F32) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
     }
@@ -3651,6 +3658,47 @@ static ggml_tensor * ggml_cuda_bf16_store_fusion_target(ggml_cgraph * cgraph, in
     return rnd;
 }
 
+// BF16 activation storage: a BF16-weight MUL_MAT whose only reader is the next
+// node's F32 -> BF16 ggml_bf16_round() store. cuBLAS accumulates in FP32 as
+// before and writes the BF16 result into the round's output, so the F32 GEMM
+// output and the round pass disappear. cuBLAS may pick another kernel for a
+// BF16 C, so this is not bit-identical to GEMM + round.
+// GGML_CUDA_NO_GEMM_BF16_STORE=1 turns this off.
+static ggml_tensor * ggml_cuda_gemm_bf16_store_target(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disable = getenv("GGML_CUDA_NO_GEMM_BF16_STORE") != nullptr ||
+                                getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") != nullptr;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (disable || node->op != GGML_OP_MUL_MAT || node->type != GGML_TYPE_F32 || i + 1 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    if (src0->type != GGML_TYPE_BF16 || !(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16) ||
+        node->op_params[0] == GGML_PREC_F32 ||
+        src1->ne[1] < 32 || src1->ne[2]*src1->ne[3] != 1 || src0->ne[2]*src0->ne[3] != 1 ||
+        !fast_bf16_hardware_available(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        return nullptr;
+    }
+    ggml_tensor * rnd = cgraph->nodes[i + 1];
+    if (rnd->op != GGML_OP_UNARY || ggml_get_unary_op(rnd) != GGML_UNARY_OP_BF16_ROUND || rnd->src[0] != node ||
+        rnd->type != GGML_TYPE_BF16 || rnd->view_src || !ggml_are_same_shape(node, rnd) ||
+        !ggml_is_contiguous(node) || !ggml_is_contiguous(rnd)) {
+        return nullptr;
+    }
+    const ggml_op ops[2] = { GGML_OP_MUL_MAT, GGML_OP_UNARY };
+    if (!ggml_can_fuse(cgraph, i, ops, 2)) {
+        return nullptr;
+    }
+    const char * d = (const char *) rnd->data;
+    for (const ggml_tensor * src : { src0, src1 }) {
+        const char * a = (const char *) src->data;
+        if (!(a + ggml_nbytes(src) <= d || d + ggml_nbytes(rnd) <= a)) {
+            return nullptr;
+        }
+    }
+    return rnd;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3660,6 +3708,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (ggml_tensor * rnd = ggml_cuda_gemm_bf16_store_target(cuda_ctx, cgraph, i)) {
+        ggml_tensor fused = *node;
+        fused.type   = rnd->type;
+        fused.data   = rnd->data;
+        fused.buffer = rnd->buffer;
+        for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+            fused.nb[k] = rnd->nb[k];
+        }
+        ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(*cuda_ctx, node->src[0], node->src[1], &fused);
+        return 1;
+    }
 
     if (ggml_tensor * rnd = ggml_cuda_bf16_store_fusion_target(cgraph, i)) {
         ggml_tensor fused = *node;
