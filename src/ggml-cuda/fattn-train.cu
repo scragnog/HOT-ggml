@@ -899,7 +899,7 @@ static int64_t fa_train_kv_grad_start(const ggml_tensor * op) {
 
 namespace fa_bf16 {
     static __device__ __forceinline__ uint32_t pack(const float lo, const float hi) {
-        const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+        const nv_bfloat162 v = __float22bfloat162_rn(make_float2(lo, hi));
         return *(const uint32_t *) &v;
     }
 
@@ -958,8 +958,8 @@ fa_train_fwd_bf16(
     static_assert(BK % 16 == 0 && NNB <= 8, "P is whole k16 A fragments; dead bits fit a uint32");
     static_assert(NT % WPR == 0 && BK % (NT/WPR) == 0, "the staging loop assumes whole rows per pass");
 
-    __shared__ __align__(16) __nv_bfloat16 Ksh[BK*DP];
-    __shared__ __align__(16) __nv_bfloat16 Vsh[BK*DP];
+    __shared__ __align__(16) nv_bfloat16 Ksh[BK*DP];
+    __shared__ __align__(16) nv_bfloat16 Vsh[BK*DP];
 
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
@@ -1080,7 +1080,7 @@ fa_train_fwd_bf16(
             for (int l = 0; l < 4; ++l) {
                 sacc[nb][l] = 0.0f;
             }
-            const __nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
+            const nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
 #pragma unroll
             for (int ks = 0; ks < NKS; ++ks) {
                 uint32_t kb[2];
@@ -1175,7 +1175,7 @@ fa_train_fwd_bf16(
             pa[1] = fa_bf16::pack(sacc[2*kk    ][2], sacc[2*kk    ][3]);
             pa[2] = fa_bf16::pack(sacc[2*kk + 1][0], sacc[2*kk + 1][1]);
             pa[3] = fa_bf16::pack(sacc[2*kk + 1][2], sacc[2*kk + 1][3]);
-            const __nv_bfloat16 * vrow = Vsh + (16*kk + lane%16)*DP;
+            const nv_bfloat16 * vrow = Vsh + (16*kk + lane%16)*DP;
 #pragma unroll
             for (int db = 0; db < NDB; ++db) {
                 uint32_t vb[2];
@@ -1249,8 +1249,8 @@ fa_train_fwd_bf16_pipe(
     static_assert(BK % 16 == 0 && NNB <= 8, "P is whole k16 A fragments; dead bits fit a uint32");
     static_assert(NT % WPR == 0 && BK % (NT/WPR) == 0, "the staging loop assumes whole rows per pass");
 
-    __shared__ __align__(16) __nv_bfloat16 Ksh[BK*DP];
-    __shared__ __align__(16) __nv_bfloat16 Vsh[BK*DP];
+    __shared__ __align__(16) nv_bfloat16 Ksh[BK*DP];
+    __shared__ __align__(16) nv_bfloat16 Vsh[BK*DP];
 
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
@@ -1318,7 +1318,7 @@ fa_train_fwd_bf16_pipe(
     constexpr int CPR = D/8;     // 16-byte chunks per K/V row
     static_assert((BK*CPR) % NT == 0, "whole chunks per thread");
     // Rows past S_kv are zero-filled (src-size 0), as the scalar staging does.
-    auto stage = [&](__nv_bfloat16 * sh, const char * base, const int64_t nb1, const int64_t jt) {
+    auto stage = [&](nv_bfloat16 * sh, const char * base, const int64_t nb1, const int64_t jt) {
 #pragma unroll
         for (int c = tid; c < BK*CPR; c += NT) {
             const int  jj = c/CPR;
@@ -1354,7 +1354,7 @@ fa_train_fwd_bf16_pipe(
             for (int l = 0; l < 4; ++l) {
                 sacc[nb][l] = 0.0f;
             }
-            const __nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
+            const nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
 #pragma unroll
             for (int ks = 0; ks < NKS; ++ks) {
                 uint32_t kb[2];
@@ -1456,7 +1456,7 @@ fa_train_fwd_bf16_pipe(
             pa[1] = fa_bf16::pack(sacc[2*kk    ][2], sacc[2*kk    ][3]);
             pa[2] = fa_bf16::pack(sacc[2*kk + 1][0], sacc[2*kk + 1][1]);
             pa[3] = fa_bf16::pack(sacc[2*kk + 1][2], sacc[2*kk + 1][3]);
-            const __nv_bfloat16 * vrow = Vsh + (16*kk + lane%16)*DP;
+            const nv_bfloat16 * vrow = Vsh + (16*kk + lane%16)*DP;
 #pragma unroll
             for (int db = 0; db < NDB; ++db) {
                 uint32_t vb[2];
@@ -3137,8 +3137,8 @@ fa_train_bwd_dq_bf16(
     static_assert(NT % WPR == 0 && BK % (NT/WPR) == 0, "the staging loop assumes whole rows per pass");
     static_assert(BQ*BK % NT == 0, "the liveness scan assumes an exact divide");
 
-    __shared__ __align__(16) __nv_bfloat16 Ksh[BK*DP];
-    __shared__ __align__(16) __nv_bfloat16 Vsh[BK*DP];
+    __shared__ __align__(16) nv_bfloat16 Ksh[BK*DP];
+    __shared__ __align__(16) nv_bfloat16 Vsh[BK*DP];
     // The liveness scan's mask tile, kept for P: double-buffered by tile so the
     // next scan can write while a slower warp still reads, rows padded so the
     // C-map read (8 rows x 4 column pairs) hits distinct banks.
@@ -3286,8 +3286,8 @@ fa_train_bwd_dq_bf16(
                 sacc[nb][l]  = 0.0f;
                 dpacc[nb][l] = 0.0f;
             }
-            const __nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
-            const __nv_bfloat16 * vrow = Vsh + (8*nb + g)*DP + 2*t;
+            const nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
+            const nv_bfloat16 * vrow = Vsh + (8*nb + g)*DP + 2*t;
 #pragma unroll
             for (int ks = 0; ks < NKS; ++ks) {
                 uint32_t kb[2];
@@ -3329,7 +3329,7 @@ fa_train_bwd_dq_bf16(
             da[1] = fa_bf16::pack(dpacc[2*kk    ][2], dpacc[2*kk    ][3]);
             da[2] = fa_bf16::pack(dpacc[2*kk + 1][0], dpacc[2*kk + 1][1]);
             da[3] = fa_bf16::pack(dpacc[2*kk + 1][2], dpacc[2*kk + 1][3]);
-            const __nv_bfloat16 * krow = Ksh + (16*kk + lane%16)*DP;
+            const nv_bfloat16 * krow = Ksh + (16*kk + lane%16)*DP;
 #pragma unroll
             for (int db = 0; db < NDB; ++db) {
                 uint32_t kb[2];
@@ -3398,8 +3398,8 @@ fa_train_bwd_dq_bf16_pipe(
     static_assert(BQ*BK % NT == 0, "the liveness scan assumes an exact divide");
 
     // Two K/V buffers: tile j+1 loads (cp.async) while tile j computes.
-    __shared__ __align__(16) __nv_bfloat16 KshB[2][BK*DP];
-    __shared__ __align__(16) __nv_bfloat16 VshB[2][BK*DP];
+    __shared__ __align__(16) nv_bfloat16 KshB[2][BK*DP];
+    __shared__ __align__(16) nv_bfloat16 VshB[2][BK*DP];
 
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
@@ -3512,8 +3512,8 @@ fa_train_bwd_dq_bf16_pipe(
             asm volatile("cp.async.wait_group 0;");
         }
         __syncthreads();
-        const __nv_bfloat16 * Ksh = KshB[buf];
-        const __nv_bfloat16 * Vsh = VshB[buf];
+        const nv_bfloat16 * Ksh = KshB[buf];
+        const nv_bfloat16 * Vsh = VshB[buf];
 
         // S = Q K^T and dP = dO V^T, the forward's QK read on both tiles.
         float sacc[NNB][4];
@@ -3525,8 +3525,8 @@ fa_train_bwd_dq_bf16_pipe(
                 sacc[nb][l]  = 0.0f;
                 dpacc[nb][l] = 0.0f;
             }
-            const __nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
-            const __nv_bfloat16 * vrow = Vsh + (8*nb + g)*DP + 2*t;
+            const nv_bfloat16 * krow = Ksh + (8*nb + g)*DP + 2*t;
+            const nv_bfloat16 * vrow = Vsh + (8*nb + g)*DP + 2*t;
 #pragma unroll
             for (int ks = 0; ks < NKS; ++ks) {
                 uint32_t kb[2];
@@ -3561,7 +3561,7 @@ fa_train_bwd_dq_bf16_pipe(
             da[1] = fa_bf16::pack(dpacc[2*kk    ][2], dpacc[2*kk    ][3]);
             da[2] = fa_bf16::pack(dpacc[2*kk + 1][0], dpacc[2*kk + 1][1]);
             da[3] = fa_bf16::pack(dpacc[2*kk + 1][2], dpacc[2*kk + 1][3]);
-            const __nv_bfloat16 * krow = Ksh + (16*kk + lane%16)*DP;
+            const nv_bfloat16 * krow = Ksh + (16*kk + lane%16)*DP;
 #pragma unroll
             for (int db = 0; db < NDB; ++db) {
                 uint32_t kb[2];
@@ -3651,10 +3651,10 @@ fa_train_bwd_dkdv_bf16(
     static_assert(NT % WPR == 0 && BJ % (NT/WPR) == 0 && BI % (NT/WPR) == 0,
                   "the staging loops assume whole rows per pass");
 
-    __shared__ __align__(16) __nv_bfloat16 Ksh [BJ*DP];
-    __shared__ __align__(16) __nv_bfloat16 Vsh [BJ*DP];
-    __shared__ __align__(16) __nv_bfloat16 Qsh [BI*DP];
-    __shared__ __align__(16) __nv_bfloat16 dOsh[BI*DP];
+    __shared__ __align__(16) nv_bfloat16 Ksh [BJ*DP];
+    __shared__ __align__(16) nv_bfloat16 Vsh [BJ*DP];
+    __shared__ __align__(16) nv_bfloat16 Qsh [BI*DP];
+    __shared__ __align__(16) nv_bfloat16 dOsh[BI*DP];
     __shared__ float lse_sh[BI];
     __shared__ float del_sh[BI];
     // The liveness scan's mask tile, kept for P^T (see the dQ kernel).
@@ -3809,8 +3809,8 @@ fa_train_bwd_dkdv_bf16(
                 }
             }
             {
-                const __nv_bfloat16 * kra = Ksh + (krow + g4)*DP + 2*t4;
-                const __nv_bfloat16 * vra = Vsh + (krow + g4)*DP + 2*t4;
+                const nv_bfloat16 * kra = Ksh + (krow + g4)*DP + 2*t4;
+                const nv_bfloat16 * vra = Vsh + (krow + g4)*DP + 2*t4;
 #pragma unroll
                 for (int ks = 0; ks < NKS; ++ks) {
                     uint32_t ka[4];
@@ -3825,8 +3825,8 @@ fa_train_bwd_dkdv_bf16(
                     va[3] = *(const uint32_t *) (vra + 16*ks + 8*DP + 8);
 #pragma unroll
                     for (int nb = 0; nb < NNB; ++nb) {
-                        const __nv_bfloat16 * qrow = Qsh  + (8*nb + g4)*DP + 2*t4 + 16*ks;
-                        const __nv_bfloat16 * orow = dOsh + (8*nb + g4)*DP + 2*t4 + 16*ks;
+                        const nv_bfloat16 * qrow = Qsh  + (8*nb + g4)*DP + 2*t4 + 16*ks;
+                        const nv_bfloat16 * orow = dOsh + (8*nb + g4)*DP + 2*t4 + 16*ks;
                         uint32_t qb[2];
                         uint32_t ob[2];
                         qb[0] = *(const uint32_t *) (qrow);
@@ -3874,8 +3874,8 @@ fa_train_bwd_dkdv_bf16(
                 da[1] = fa_bf16::pack(dpacc[2*kk    ][2], dpacc[2*kk    ][3]);
                 da[2] = fa_bf16::pack(dpacc[2*kk + 1][0], dpacc[2*kk + 1][1]);
                 da[3] = fa_bf16::pack(dpacc[2*kk + 1][2], dpacc[2*kk + 1][3]);
-                const __nv_bfloat16 * orow = dOsh + (16*kk + lane%16)*DP + dbase;
-                const __nv_bfloat16 * qrow = Qsh  + (16*kk + lane%16)*DP + dbase;
+                const nv_bfloat16 * orow = dOsh + (16*kk + lane%16)*DP + dbase;
+                const nv_bfloat16 * qrow = Qsh  + (16*kk + lane%16)*DP + dbase;
 #pragma unroll
                 for (int db = 0; db < NDB; ++db) {
                     uint32_t ob[2];
@@ -3926,10 +3926,10 @@ fa_train_bwd_dkdv_bf16(
 
 // dO rounded to BF16 once, for the pipelined dK/dV kernel's 16-byte copies:
 // the same RNE cast the scalar kernels apply while staging.
-static __global__ void fa_train_round_do_bf16(const float * __restrict__ x, __nv_bfloat16 * __restrict__ y, const int64_t n) {
+static __global__ void fa_train_round_do_bf16(const float * __restrict__ x, nv_bfloat16 * __restrict__ y, const int64_t n) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) {
-        y[i] = __float2bfloat16_rn(x[i]);
+        y[i] = __float2bfloat16(x[i]);
     }
 }
 
@@ -3954,7 +3954,7 @@ fa_train_bwd_dkdv_bf16_pipe(
         const int64_t G, const float scale,
         const int GS, const int64_t part_stride,
         const int64_t causal, const int64_t kv0,
-        const __nv_bfloat16 * __restrict__ do16) {
+        const nv_bfloat16 * __restrict__ do16) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int DH  = FA_TRAIN_BF16_DKDV_DH;
     constexpr int NW  = FA_TRAIN_BF16_DKDV_NW;
@@ -3973,11 +3973,11 @@ fa_train_bwd_dkdv_bf16_pipe(
     static_assert(NT % WPR == 0 && BJ % (NT/WPR) == 0 && BI % (NT/WPR) == 0,
                   "the staging loops assume whole rows per pass");
 
-    __shared__ __align__(16) __nv_bfloat16 Ksh [BJ*DP];
-    __shared__ __align__(16) __nv_bfloat16 Vsh [BJ*DP];
+    __shared__ __align__(16) nv_bfloat16 Ksh [BJ*DP];
+    __shared__ __align__(16) nv_bfloat16 Vsh [BJ*DP];
     // Two Q/dO/LSE/D_i buffers: tile t+1 loads (cp.async) while tile t computes.
-    __shared__ __align__(16) __nv_bfloat16 QshB [2][BI*DP];
-    __shared__ __align__(16) __nv_bfloat16 dOshB[2][BI*DP];
+    __shared__ __align__(16) nv_bfloat16 QshB [2][BI*DP];
+    __shared__ __align__(16) nv_bfloat16 dOshB[2][BI*DP];
     __shared__ __align__(16) float lseB[2][BI];
     __shared__ __align__(16) float delB[2][BI];
 
@@ -4089,8 +4089,8 @@ fa_train_bwd_dkdv_bf16_pipe(
             asm volatile("cp.async.wait_group 0;");
         }
         __syncthreads();   // also publishes the resident K/V on the first tile
-        const __nv_bfloat16 * Qsh    = QshB [buf];
-        const __nv_bfloat16 * dOsh   = dOshB[buf];
+        const nv_bfloat16 * Qsh    = QshB [buf];
+        const nv_bfloat16 * dOsh   = dOshB[buf];
         const float         * lse_sh = lseB [buf];
         const float         * del_sh = delB [buf];
 
@@ -4108,8 +4108,8 @@ fa_train_bwd_dkdv_bf16_pipe(
                 }
             }
             {
-                const __nv_bfloat16 * kra = Ksh + (krow + g4)*DP + 2*t4;
-                const __nv_bfloat16 * vra = Vsh + (krow + g4)*DP + 2*t4;
+                const nv_bfloat16 * kra = Ksh + (krow + g4)*DP + 2*t4;
+                const nv_bfloat16 * vra = Vsh + (krow + g4)*DP + 2*t4;
 #pragma unroll
                 for (int ks = 0; ks < NKS; ++ks) {
                     uint32_t ka[4];
@@ -4124,8 +4124,8 @@ fa_train_bwd_dkdv_bf16_pipe(
                     va[3] = *(const uint32_t *) (vra + 16*ks + 8*DP + 8);
 #pragma unroll
                     for (int nb = 0; nb < NNB; ++nb) {
-                        const __nv_bfloat16 * qrow = Qsh  + (8*nb + g4)*DP + 2*t4 + 16*ks;
-                        const __nv_bfloat16 * orow = dOsh + (8*nb + g4)*DP + 2*t4 + 16*ks;
+                        const nv_bfloat16 * qrow = Qsh  + (8*nb + g4)*DP + 2*t4 + 16*ks;
+                        const nv_bfloat16 * orow = dOsh + (8*nb + g4)*DP + 2*t4 + 16*ks;
                         uint32_t qb[2];
                         uint32_t ob[2];
                         qb[0] = *(const uint32_t *) (qrow);
@@ -4166,8 +4166,8 @@ fa_train_bwd_dkdv_bf16_pipe(
                 da[1] = fa_bf16::pack(dpacc[2*kk    ][2], dpacc[2*kk    ][3]);
                 da[2] = fa_bf16::pack(dpacc[2*kk + 1][0], dpacc[2*kk + 1][1]);
                 da[3] = fa_bf16::pack(dpacc[2*kk + 1][2], dpacc[2*kk + 1][3]);
-                const __nv_bfloat16 * orow = dOsh + (16*kk + lane%16)*DP + dbase;
-                const __nv_bfloat16 * qrow = Qsh  + (16*kk + lane%16)*DP + dbase;
+                const nv_bfloat16 * orow = dOsh + (16*kk + lane%16)*DP + dbase;
+                const nv_bfloat16 * qrow = Qsh  + (16*kk + lane%16)*DP + dbase;
 #pragma unroll
                 for (int db = 0; db < NDB; ++db) {
                     uint32_t ob[2];
@@ -4394,7 +4394,7 @@ void ggml_cuda_flash_attn_train_back(ggml_backend_cuda_context & ctx, ggml_tenso
 
         fa_train_bwd_delta_f32<128><<<grid_delta, block, 0, stream>>>(
                 o_data, do_data, delta.get(), nrows);
-        ggml_cuda_pool_alloc<__nv_bfloat16> do16(ctx.pool());
+        ggml_cuda_pool_alloc<nv_bfloat16> do16(ctx.pool());
         if (fa_train_pipe_ok(dst)) {
             do16.alloc((size_t) n_q);
             fa_train_round_do_bf16<<<(unsigned) ((n_q + 255)/256), 256, 0, stream>>>(do_data, do16.get(), n_q);
