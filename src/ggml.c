@@ -7388,9 +7388,21 @@ static void ggml_compute_backward(
                 // ACTIVATION-sized tensor, so copying it would cost more than the
                 // GEMM saves). Found by ace-train train-dit --self-test under
                 // GGML_BACKWARD_MM=1: the LoKR rung SC3 aborted here.
+                //
+                // Windows reads the process environment, not the CRT's copy: with a
+                // static CRT (/MT) each DLL keeps its own snapshot taken at load, so
+                // a trainer's _putenv after startup never reached this getenv and a
+                // quantized base fell back to an OUT_PROD CUDA refuses. _putenv also
+                // sets the process variable, which this sees.
                 static int hs_bwd_mm = -1;
                 if (hs_bwd_mm < 0) {
+#if defined(_WIN32)
+                    char hs_buf[32];
+                    const DWORD hs_n = GetEnvironmentVariableA("GGML_BACKWARD_MM", hs_buf, sizeof(hs_buf));
+                    const char * hs_e = hs_n > 0 && hs_n < sizeof(hs_buf) ? hs_buf : NULL;
+#else
                     const char * hs_e = getenv("GGML_BACKWARD_MM");
+#endif
                     hs_bwd_mm = (hs_e && hs_e[0] && strcmp(hs_e, "0") != 0) ? 1 : 0;
                 }
                 // HOT-Step patch: mm-backward — TRANSIENT-CAST RE-EMISSION
