@@ -8,6 +8,9 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+// HOT-Step: store bf16_round_cast(result), absorbing a following single-consumer BF16_ROUND
+// (checked host-side in ggml_metal_op_mul_mat; simdgroup kernel only)
+constant bool FC_mul_mm_rnd    [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -313,6 +316,33 @@ kernel void kernel_mul_mm(
             lsma += 8*64;
             lsmb += 4*64;
         }
+    }
+
+    if (FC_mul_mm_rnd) {
+        // round on the way out: stage the accumulators through threadgroup memory (as the
+        // tail path below does) and round each F32 result as the BF16_ROUND pass would.
+        // Rounding the simdgroup matrices in registers (thread_elements) costs ~4x here.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j = sgitg; j < nr1; j += N_MM_SIMD_GROUP_X*N_MM_SIMD_GROUP_Y) {
+            device float * D = (device float *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+
+            threadgroup const float * C = (threadgroup const float *) shmem + j*NR0;
+
+            for (int i = tiitg%N_SIMDWIDTH; i < nr0; i += N_SIMDWIDTH) {
+                D[i] = bf16_round_cast<float>(C[i]);
+            }
+        }
+
+        return;
     }
 
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {

@@ -201,6 +201,46 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+// HOT-Step: BF16_ROUND producer epilogues. GGML_METAL_NO_BF16_ROUND_PRODUCER=1 (or disabling
+// fusion) turns them and the in-place round skip off, so every BF16_ROUND runs as its own pass.
+static bool ggml_metal_op_bf16_round_producer(ggml_metal_op_t ctx) {
+    static const bool disabled = getenv("GGML_METAL_NO_BF16_ROUND_PRODUCER") != nullptr;
+    return !disabled && ctx->use_fusion();
+}
+
+// True when node idx + 1 is a single-consumer F32 ggml_bf16_round() of node idx, so the
+// producer can store the rounded value itself: the same F32 result through the same
+// bf16_round_cast as kernel_unary_impl, written to the round's buffer instead.
+static bool ggml_metal_op_can_fuse_round(ggml_metal_op_t ctx, int idx) {
+    if (!ggml_metal_op_bf16_round_producer(ctx)) {
+        return false;
+    }
+
+    const ggml_tensor * node = ctx->node(idx);
+    const ggml_op ops[2] = { node->op, GGML_OP_UNARY };
+    if (!ctx->can_fuse(idx, ops, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * round = ctx->node(idx + 1);
+
+    return ggml_get_unary_op(round) == GGML_UNARY_OP_BF16_ROUND && round->src[0] == node &&
+           node->type == GGML_TYPE_F32 && round->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(node) && ggml_is_contiguous(round);
+}
+
+// Before a producer writes into the fused round's buffer: that buffer has not been
+// checked against the ranges of the nodes already in flight.
+static void ggml_metal_op_fuse_round_ranges(ggml_metal_op_t ctx, int idx) {
+    if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + 1))) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: %s + BF16_ROUND\n", __func__, ggml_op_desc(ctx->node(idx)));
+    }
+}
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
 
@@ -233,6 +273,17 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 1;
+    }
+
+    // HOT-Step: ggml_bf16_round() marks a round of an already-rounded value and makes it
+    // in place: it would rewrite the same bits, so encode nothing (CUDA skips it too).
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_BF16_ROUND &&
+        ggml_get_op_params_i32(node, 1) == 1 && node->data == node->src[0]->data &&
+        ggml_metal_op_bf16_round_producer(ctx)) {
+        if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+            GGML_LOG_DEBUG("%s: skip: in-place BF16_ROUND\n", __func__);
+        }
         return 1;
     }
 
@@ -1071,7 +1122,15 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         args.val   = ggml_get_op_params_f32(op, 4); // eps
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op);
+    // HOT-Step: SILU rounds a following single-consumer BF16_ROUND as it stores
+    const bool round_epilogue = op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SILU &&
+                                ggml_metal_op_can_fuse_round(ctx, idx);
+    if (round_epilogue) {
+        ggml_metal_op_fuse_round_ranges(ctx, idx);
+        bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + 1));
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op, round_epilogue);
 
     if (pipeline.c4) {
         args.ne00 = ne00/4;
@@ -1095,7 +1154,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, nk0*ne01, ne02, ne03, nth, 1, 1);
     }
 
-    return 1;
+    return round_epilogue ? 2 : 1;
 }
 
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
@@ -2699,6 +2758,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
+    int n_fuse = 1;
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -2828,7 +2889,18 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        // HOT-Step: the simdgroup kernel rounds a following single-consumer BF16_ROUND in its
+        // store; the tensor-API kernel has no such epilogue
+        const bool round_epilogue = !props_dev->has_tensor && ggml_metal_op_can_fuse_round(ctx, idx);
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, round_epilogue);
+
+        ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+        if (round_epilogue) {
+            ggml_metal_op_fuse_round_ranges(ctx, idx);
+            bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + 1));
+            n_fuse = 2;
+        }
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -2851,7 +2923,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,                              3);
 
         const size_t smem = pipeline.smem;
 
@@ -2951,7 +3023,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    return 1;
+    return n_fuse;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
@@ -4592,9 +4664,16 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // HOT-Step: an unfused RMS_NORM rounds a following single-consumer BF16_ROUND as it stores
+    const bool round_epilogue = n_fuse == 1 && op->op == GGML_OP_RMS_NORM && ggml_metal_op_can_fuse_round(ctx, idx);
+    if (round_epilogue) {
+        ggml_metal_op_fuse_round_ranges(ctx, idx);
+        bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + 1));
+    }
+
     auto pipeline = fused_norm_scale ?
         ggml_metal_library_get_pipeline_norm_scale(lib, op) :
-        ggml_metal_library_get_pipeline_norm(lib, op, n_fuse);
+        ggml_metal_library_get_pipeline_norm(lib, op, n_fuse, round_epilogue);
 
     int nth = 32; // SIMD width
 
@@ -4618,7 +4697,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
-    return n_fuse;
+    return n_fuse + (round_epilogue ? 1 : 0);
 }
 
 // HOT-Step: RMS_NORM_BACK -- see the kernel's own comment in

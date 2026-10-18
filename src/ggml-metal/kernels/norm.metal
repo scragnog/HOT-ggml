@@ -1,6 +1,9 @@
 #include "common.h"
 
 constant bool FC_norm_use_scale [[function_constant(FC_NORM + 0)]];
+// HOT-Step: rms_norm (F == 1) stores bf16_round_cast(result), absorbing a following
+// single-consumer BF16_ROUND (checked host-side in ggml_metal_op_norm)
+constant bool FC_norm_rnd       [[function_constant(FC_NORM + 1)]];
 
 // F == 1 : norm (no fuse)
 // F == 2 : norm + mul
@@ -158,7 +161,7 @@ kernel void kernel_rms_norm_fuse_impl(
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         if (F == 1) {
-            y[i00] = (x[i00]*scale);
+            y[i00] = FC_norm_rnd ? bf16_round_cast<T>(x[i00]*scale) : (x[i00]*scale);
         }
         if (F == 2) {
             if (FC_norm_use_scale) {
