@@ -1477,6 +1477,15 @@ void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cm
     [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
 }
 
+void ggml_metal_cmd_buf_add_completed_handler(ggml_metal_cmd_buf_t cmd_buf_raw, void (*fn)(void *), void * arg) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        (void) cb;
+        fn(arg);
+    }];
+}
+
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
 

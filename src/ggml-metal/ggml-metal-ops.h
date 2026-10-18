@@ -125,6 +125,9 @@ int ggml_metal_op_count_equal       (ggml_metal_op_t ctx, int idx);
 // debug (GGML_METAL_CR8B_CHECK=1): print the accumulated convrot8 backward comparison, called from ggml_metal_free
 void ggml_metal_op_convrot8_check_report(void);
 
+// HOT-Step: drop the half pre-pass scratch (freed once no command buffer uses it), called from ggml_metal_free
+void ggml_metal_op_mul_mat_hp_release(void);
+
 #ifdef __cplusplus
 }
 #endif

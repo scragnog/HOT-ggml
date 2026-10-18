@@ -48,6 +48,7 @@ struct ggml_metal_op {
         int  debug_graph) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
+        this->cmd_buf         = cmd_buf;
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
@@ -125,6 +126,7 @@ struct ggml_metal_op {
 
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
 
@@ -2785,21 +2787,79 @@ static bool ggml_metal_op_mul_mat_hp_ok(ggml_metal_op_t ctx, const ggml_tensor *
 
 // Scratch for the pre-pass copies, shared by all ops and grown on demand. Command buffers on the
 // queue are ordered on it by Metal's hazard tracking; within an encoder the op puts barriers around
-// its pre-pass. Old buffers are leaked on purpose: they may still be in flight.
-static ggml_metal_buffer_id ggml_metal_op_mul_mat_hp_scratch(ggml_metal_op_t ctx, size_t need) {
-    static std::mutex mtx;
-    static ggml_metal_buffer_t buf = nullptr;
-    static size_t cap = 0;
+// its pre-pass. Each use holds a reference until its command buffer completes, and the current
+// buffer holds one more; a replaced buffer is freed once its references are gone, on the next use
+// or in ggml_metal_op_mul_mat_hp_release, never on Metal's completion thread.
+struct ggml_metal_hp_scratch {
+    ggml_metal_buffer_t buf;
+    size_t cap;
+    int    refs;
+};
 
-    std::lock_guard<std::mutex> lock(mtx);
-    if (need > cap) {
-        const size_t step = 64u << 20;
-        cap = (need + step - 1) / step * step;
-        buf = ggml_metal_buffer_init(ctx->dev, cap, false);
-        GGML_ASSERT(buf && "half pre-pass scratch allocation failed");
+static std::mutex                           g_hp_mtx;
+static ggml_metal_hp_scratch *              g_hp_cur = nullptr;
+static std::vector<ggml_metal_hp_scratch *> g_hp_retired;
+static size_t                               g_hp_n_alloc = 0;
+static size_t                               g_hp_n_free  = 0;
+
+// with g_hp_mtx held
+static void ggml_metal_hp_scratch_collect() {
+    for (size_t i = 0; i < g_hp_retired.size(); ) {
+        ggml_metal_hp_scratch * s = g_hp_retired[i];
+        if (s->refs > 0) {
+            i++;
+            continue;
+        }
+        ggml_metal_buffer_free(s->buf);
+        delete s;
+        g_hp_retired.erase(g_hp_retired.begin() + i);
+        g_hp_n_free++;
     }
+}
 
-    return ggml_metal_buffer_get_id_raw(buf);
+// with g_hp_mtx held
+static void ggml_metal_hp_scratch_retire_current() {
+    if (g_hp_cur) {
+        g_hp_cur->refs--;
+        g_hp_retired.push_back(g_hp_cur);
+        g_hp_cur = nullptr;
+    }
+}
+
+static void ggml_metal_hp_scratch_unref(void * p) {
+    std::lock_guard<std::mutex> lock(g_hp_mtx);
+    ((ggml_metal_hp_scratch *) p)->refs--;
+}
+
+void ggml_metal_op_mul_mat_hp_release(void) {
+    std::lock_guard<std::mutex> lock(g_hp_mtx);
+    ggml_metal_hp_scratch_retire_current();
+    ggml_metal_hp_scratch_collect();
+    if (g_hp_n_alloc > 0) {
+        GGML_LOG_DEBUG("%s: half pre-pass scratch: %zu allocated, %zu freed, %zu still in flight\n",
+                __func__, g_hp_n_alloc, g_hp_n_free, g_hp_retired.size());
+    }
+}
+
+static ggml_metal_buffer_id ggml_metal_op_mul_mat_hp_scratch(ggml_metal_op_t ctx, size_t need) {
+    std::lock_guard<std::mutex> lock(g_hp_mtx);
+    if (!g_hp_cur || need > g_hp_cur->cap) {
+        ggml_metal_hp_scratch_retire_current();
+        const size_t step = 64u << 20;
+        const size_t cap  = (need + step - 1) / step * step;
+        ggml_metal_buffer_t buf = ggml_metal_buffer_init(ctx->dev, cap, false);
+        GGML_ASSERT(buf && "half pre-pass scratch allocation failed");
+        g_hp_cur = new ggml_metal_hp_scratch { buf, cap, 1 };
+        g_hp_n_alloc++;
+        GGML_LOG_DEBUG("%s: half pre-pass scratch: %zu bytes (allocated %zu, freed %zu)\n",
+                __func__, cap, g_hp_n_alloc, g_hp_n_free);
+    }
+    ggml_metal_hp_scratch_collect();
+
+    g_hp_cur->refs++;
+    ggml_metal_cmd_buf_add_completed_handler(ctx->cmd_buf, ggml_metal_hp_scratch_unref, g_hp_cur);
+
+    return ggml_metal_buffer_get_id_raw(g_hp_cur->buf);
 }
 
 static void ggml_metal_op_mul_mat_hp(ggml_metal_op_t ctx, const ggml_tensor * op, bool round_epilogue, ggml_metal_buffer_id bid_dst) {

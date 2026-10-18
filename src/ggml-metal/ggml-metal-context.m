@@ -194,6 +194,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     ggml_metal_op_convrot8_check_report();
+    ggml_metal_op_mul_mat_hp_release();
 
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 

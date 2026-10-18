@@ -327,6 +327,9 @@ typedef struct ggml_metal_event * ggml_metal_event_t;
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 
+// HOT-Step: call fn(arg) on a Metal thread once cmd_buf has completed (add before the commit)
+void ggml_metal_cmd_buf_add_completed_handler(ggml_metal_cmd_buf_t cmd_buf, void (*fn)(void *), void * arg);
+
 ggml_metal_device_t ggml_metal_device_init(int device, int n_devices);
 void ggml_metal_device_free(ggml_metal_device_t dev);
 
