@@ -1076,8 +1076,10 @@ kernel void kernel_out_prod_f32(
 // operands are already float32, no scale/bias epilogue, and no periodic
 // int32-flush trick is needed (nothing here requires exact accumulation).
 //
-// Threadgroup memory: sA (src0/M tile) 64*36 + sB (src1/N tile) 32*36 +
-// sc (fp32 store scratch) 32*64 floats = 22016 bytes.
+// Threadgroup memory: sA (src0/M tile) 64*36 + sB (src1/N tile) 32*36
+// floats = 13824 bytes; sc (fp32 store scratch, 32*64 floats) aliases sA
+// once the K loop is done. At 22016 bytes (sc separate) one threadgroup
+// filled a core's threadgroup memory; aliasing lets two run per core.
 kernel void kernel_out_prod_mm_f32(
         constant ggml_metal_kargs_out_prod & args,
         device const char * src0, // [ne00, ne01, ne02, ne03] F32, general strides
@@ -1089,7 +1091,7 @@ kernel void kernel_out_prod_mm_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     threadgroup float * sA = (threadgroup float *) shmem;                                    // [OP_NR0][OP_LDS]
     threadgroup float * sB = (threadgroup float *) (shmem + OP_NR0*OP_LDS*sizeof(float));     // [OP_NR1][OP_LDS]
-    threadgroup float * sc = (threadgroup float *) (shmem + (OP_NR0 + OP_NR1)*OP_LDS*sizeof(float)); // [OP_NR1][OP_NR0]
+    threadgroup float * sc = (threadgroup float *) shmem;                                    // [OP_NR1][OP_NR0], aliases sA after the K loop
 
     const int r1 = int(tgpig.x)*OP_NR1; // first N (i1) index of this tile
     const int r0 = int(tgpig.y)*OP_NR0; // first M (i0) index of this tile
@@ -1158,6 +1160,9 @@ kernel void kernel_out_prod_mm_f32(
         }
     }
 
+    // every simdgroup is done reading sA/sB before sc overwrites them
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     for (short i = 0; i < 8; ++i) {
         simdgroup_store(mc[i], sc + (8*(i/2))*OP_NR0 + 16*sgitg + 8*(i%2), OP_NR0);
     }
@@ -1205,8 +1210,8 @@ kernel void kernel_out_prod_mm_f32(
 // (2 simdgroups split N into halves, 2 split M into halves) instead of
 // the kernel above's 1x4 split of a 64-wide M axis alone, so every
 // simdgroup does useful work on every iteration. Threadgroup memory drops
-// to 32*36 + 32*36 + 32*32 = 13312 bytes (vs the 22016 bytes above), a
-// bonus, not the point of the change.
+// to 32*36 + 32*36 = 9216 bytes (vs the 13824 bytes above; sc aliases sA
+// here too), a bonus, not the point of the change.
 //
 // Selected by the dispatch side (ggml_metal_op_out_prod) only when
 // ne00 <= OP_NR0_SM; kernel_out_prod_mm_f32 above is unchanged and still
@@ -1227,7 +1232,7 @@ kernel void kernel_out_prod_mm_f32_sm(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     threadgroup float * sA = (threadgroup float *) shmem;                                       // [OP_NR0_SM][OP_LDS]
     threadgroup float * sB = (threadgroup float *) (shmem + OP_NR0_SM*OP_LDS*sizeof(float));     // [OP_NR1_SM][OP_LDS]
-    threadgroup float * sc = (threadgroup float *) (shmem + (OP_NR0_SM + OP_NR1_SM)*OP_LDS*sizeof(float)); // [OP_NR1_SM][OP_NR0_SM]
+    threadgroup float * sc = (threadgroup float *) shmem;                                       // [OP_NR1_SM][OP_NR0_SM], aliases sA after the K loop
 
     const int r1 = int(tgpig.x)*OP_NR1_SM; // first N (i1) index of this tile
     const int r0 = int(tgpig.y)*OP_NR0_SM; // first M (i0) index of this tile
@@ -1298,6 +1303,9 @@ kernel void kernel_out_prod_mm_f32_sm(
             }
         }
     }
+
+    // every simdgroup is done reading sA/sB before sc overwrites them
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short i = 0; i < 4; ++i) {
         simdgroup_store(mc[i], sc + (16*sg_n + 8*(i/2))*OP_NR0_SM + (16*sg_m + 8*(i%2)), OP_NR0_SM);

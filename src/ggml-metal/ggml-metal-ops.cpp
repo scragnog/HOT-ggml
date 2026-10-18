@@ -5144,9 +5144,10 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
             small_m ? "kernel_out_prod_mm_f32_sm" : "kernel_out_prod_mm_f32");
         GGML_ASSERT(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_mm) >= 128);
 
+        // sA + sB; the store scratch aliases sA (see the kernels)
         const size_t smem_mm = small_m
-            ? (size_t) (32*36 + 32*36 + 32*32)*sizeof(float)
-            : (size_t) (64*36 + 32*36 + 32*64)*sizeof(float);
+            ? (size_t) (32*36 + 32*36)*sizeof(float)
+            : (size_t) (64*36 + 32*36)*sizeof(float);
         GGML_ASSERT(smem_mm <= props_dev->max_theadgroup_memory_size);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline_mm);
