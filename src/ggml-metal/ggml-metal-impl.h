@@ -723,6 +723,12 @@ typedef struct {
     uint64_t nb1,  nb2,  nb3;        // dst strides
     // HOT-Step: used by the tiled kernel only (kernel_out_prod_mm_f32).
     int32_t  ne1, ne2, ne3;
+    // HOT-Step: split-K (tiled kernels and kernel_out_prod_reduce_f32).
+    // Threadgroup z = split*ne2*ne3 + i3*ne2 + i2; split s reduces
+    // k in [s*k_chunk, min(ne01, (s+1)*k_chunk)). nsplit == 1 writes dst
+    // directly (k_chunk == ne01); otherwise each split writes a contiguous
+    // F32 partial [nsplit][ne3*ne2][ne1][ne00] in the scratch after dst.
+    int32_t  k_chunk, nsplit;
 } ggml_metal_kargs_out_prod;
 
 // HOT-Step: FLASH_ATTN_TRAIN / FLASH_ATTN_TRAIN_BACK (kernel #7, last of
