@@ -2424,6 +2424,43 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
     hot_step_cpy_info("cpy", op);
+    // Same-type transposed row views only. Reshapes, casts, overlapping copies and
+    // other permutations retain the generic copy. GGML_METAL_CPY_TRANSPOSE=0 is a control.
+    const ggml_tensor * src = op->src[0];
+    static const bool transpose_on = [] {
+        const char * e = getenv("GGML_METAL_CPY_TRANSPOSE");
+        return !(e && strcmp(e, "0") == 0);
+    }();
+    bool transpose_ok = transpose_on &&
+        (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_BF16) && src->type == op->type &&
+        ggml_are_same_shape(src, op) && ggml_is_contiguous(op) && ne00 >= 32 && ne01 >= 32;
+    if (transpose_ok) {
+        const size_t ts = ggml_type_size(src->type);
+        transpose_ok = nb01 == ts && nb00 >= ts*ne01 &&
+            nb02 >= nb00*(ne00 - 1) + ts*ne01 &&
+            nb03 >= nb02*(ne02 - 1) + nb00*(ne00 - 1) + ts*ne01 &&
+            nb00 % ts == 0 && nb02 % ts == 0 && nb03 % ts == 0 &&
+            (uintptr_t) src->data % ts == 0 && (uintptr_t) op->data % ts == 0 &&
+            (int64_t) ne02*ne03 <= INT_MAX;
+        const uintptr_t s = (uintptr_t) src->data, d = (uintptr_t) op->data;
+        transpose_ok = transpose_ok && (s <= d ? d - s >= ggml_nbytes(src) : s - d >= ggml_nbytes(op));
+    }
+    if (transpose_ok) {
+        const char * name = src->type == GGML_TYPE_F32 ? "kernel_cpy_transpose_f32" : "kernel_cpy_transpose_bf16";
+        auto pipeline = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+        if (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 256) {
+            ggml_metal_kargs_cpy args = {
+                ne00, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
+                ne0, ne1, ne2, ne3, nb0, nb1, nb2, nb3,
+            };
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne00 + 31)/32, (ne01 + 31)/32, ne02*ne03, 32, 8, 1);
+            return 1;
+        }
+    }
     if (hot_step_cpy_v4_ok(op->src[0], op)) {
         hot_step_cpy_v4_dispatch(lib, enc, op->src[0], op);
         return 1;

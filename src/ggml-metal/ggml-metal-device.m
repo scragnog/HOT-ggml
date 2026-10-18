@@ -130,7 +130,8 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
     X(MISC,            misc)           \
-    X(HOTSTEP_TRAIN,   hotstep_train)
+    X(HOTSTEP_TRAIN,   hotstep_train)   \
+    X(TRANSPOSE,       transpose)
 
 enum ggml_metal_lib_kind {
 #define X(e, s) GGML_METAL_LIB_##e,

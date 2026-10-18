@@ -52,6 +52,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/pool.metal
     kernels/misc.metal
     kernels/hotstep_train.metal
+    kernels/transpose.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)
