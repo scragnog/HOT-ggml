@@ -2448,7 +2448,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     if (transpose_ok) {
         const char * name = src->type == GGML_TYPE_F32 ? "kernel_cpy_transpose_f32" : "kernel_cpy_transpose_bf16";
         auto pipeline = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-        if (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 256) {
+        if (pipeline.pipeline && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 256) {
             ggml_metal_kargs_cpy args = {
                 ne00, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
                 ne0, ne1, ne2, ne3, nb0, nb1, nb2, nb3,
@@ -2457,7 +2457,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src), 1);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne00 + 31)/32, (ne01 + 31)/32, ne02*ne03, 32, 8, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1 + (ne00 - 1)/32, 1 + (ne01 - 1)/32, ne02*ne03, 32, 8, 1);
             return 1;
         }
     }
