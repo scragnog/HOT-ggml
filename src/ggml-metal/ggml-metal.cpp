@@ -251,12 +251,6 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 // unconditionally so the env switch never changes allocation.
                 res += ggml_metal_op_convrot8_extra(tensor);
             } break;
-        case GGML_OP_OUT_PROD:
-            {
-                // HOT-Step: split-K partials for the tiled OUT_PROD path, see
-                // ggml_metal_op_out_prod_extra. Sized from the shape alone.
-                res += ggml_metal_op_out_prod_extra(tensor);
-            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {

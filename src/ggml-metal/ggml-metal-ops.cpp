@@ -5089,73 +5089,6 @@ static int ggml_metal_out_prod_tiled(void) {
     return !(e && *e && strcmp(e, "0") == 0);
 }
 
-// HOT-Step: split-K for the tiled OUT_PROD path. The LoRA weight gradients
-// reduce over the whole sequence (K = 7668 at rank 64) into a small dst, so
-// the (ne1/32) x (ne00/tile) grid is 32-192 threadgroups, each walking every
-// K row: too few to keep a 30-core GPU busy. Each split reduces one K chunk into
-// an F32 partial in scratch after dst; kernel_out_prod_reduce_f32 then sums
-// the partials in split order. No atomics, so the result is deterministic;
-// it differs from the unsplit kernel by float32 summation order only.
-// The plan depends on the shape alone: the allocation size
-// (ggml_backend_metal_buffer_type_get_alloc_size) and the encoder agree, and
-// the scratch lives and dies with dst in the graph allocator.
-// GGML_METAL_OUT_PROD_SPLIT_K=0 keeps one split (the scratch stays reserved).
-struct hs_out_prod_split {
-    int32_t nsplit;
-    int32_t k_chunk;
-};
-
-static hs_out_prod_split hs_out_prod_split_get(const ggml_tensor * op) {
-    const int64_t ne00 = op->ne[0];
-    const int64_t ne1  = op->ne[1];
-    const int64_t nz   = op->ne[2]*op->ne[3];
-    const int64_t K    = op->src[0]->ne[1];
-
-    if (ne00*ne1*nz == 0) {
-        return { 1, (int32_t) K };
-    }
-
-    const int64_t tiles = ((ne1 + 31)/32) * (ne00 <= 32 ? (ne00 + 31)/32 : (ne00 + 63)/64) * nz;
-
-    // Measured on an M2 Max (30 cores) at the rank-64 joint-training shapes:
-    // 512 -> 2048 cut the 192-tile shapes from 4.5 to 3.7 ms; 4096 and 8192
-    // were no faster.
-    const int64_t target_tg  = 2048;      // threadgroups to aim for
-    const int64_t min_chunk  = 256;       // K rows per split, at least 8 tiles of 32
-    const int64_t max_split  = 32;
-    const size_t  max_bytes  = 64u << 20; // partials cap
-
-    int64_t n = (target_tg + tiles - 1)/tiles;
-    n = std::min(n, std::max<int64_t>(1, K/min_chunk));
-    n = std::min(n, max_split);
-    n = std::min<int64_t>(n, std::max<int64_t>(1, (int64_t) (max_bytes / (sizeof(float)*ne00*ne1*nz))));
-    n = std::max<int64_t>(n, 1);
-
-    // whole 32-row K tiles per chunk, then drop any split left empty
-    int64_t chunk = (((K + n - 1)/n + 31)/32)*32;
-    if (n == 1) chunk = K;
-    n = (K + chunk - 1)/chunk;
-    if (n <= 1) { n = 1; chunk = K; }
-
-    return { (int32_t) n, (int32_t) chunk };
-}
-
-size_t ggml_metal_op_out_prod_extra(const ggml_tensor * op) {
-    GGML_ASSERT(op->op == GGML_OP_OUT_PROD);
-
-    const hs_out_prod_split p = hs_out_prod_split_get(op);
-    if (p.nsplit <= 1) {
-        return 0;
-    }
-    const size_t base = ggml_nbytes(op);
-    return (GGML_PAD(base, 32) - base) + (size_t) p.nsplit*op->ne[0]*op->ne[1]*op->ne[2]*op->ne[3]*sizeof(float);
-}
-
-static bool ggml_metal_out_prod_split_k(void) {
-    const char * e = getenv("GGML_METAL_OUT_PROD_SPLIT_K");
-    return !(e && *e && strcmp(e, "0") == 0);
-}
-
 int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5190,8 +5123,6 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         /*.ne1  =*/ (int32_t) ne1,
         /*.ne2  =*/ (int32_t) ne2,
         /*.ne3  =*/ (int32_t) ne3,
-        /*.k_chunk =*/ (int32_t) ne01,
-        /*.nsplit  =*/ 1,
     };
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
@@ -5219,44 +5150,15 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
             : (size_t) (64*36 + 32*36)*sizeof(float);
         GGML_ASSERT(smem_mm <= props_dev->max_theadgroup_memory_size);
 
-        if (ggml_metal_out_prod_split_k()) {
-            const hs_out_prod_split plan = hs_out_prod_split_get(op);
-            args.nsplit  = plan.nsplit;
-            args.k_chunk = plan.k_chunk;
-        }
-
-        ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
-        ggml_metal_buffer_id bid_part = bid_dst;
-        if (args.nsplit > 1) {
-            bid_part.offs += GGML_PAD(ggml_nbytes(op), 32);
-        }
-
         ggml_metal_encoder_set_pipeline(enc, pipeline_mm);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
-        ggml_metal_encoder_set_buffer  (enc, bid_part, 4);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((size_t)(smem_mm), 16), 0);
 
         const int64_t m_tiles = small_m ? (ne00 + 31)/32 : (ne00 + 63)/64;
-        ggml_metal_encoder_dispatch_threadgroups(enc, (ne1 + 31)/32, m_tiles, ne2*ne3*args.nsplit, 128, 1, 1);
-
-        if (args.nsplit > 1) {
-            // partials must be visible before the reduce reads them
-            ggml_metal_op_concurrency_reset(ctx);
-
-            auto pipeline_red = ggml_metal_library_get_pipeline_convrot8_named(lib, "kernel_out_prod_reduce_f32");
-
-            const int64_t n   = ne0*ne1*ne2*ne3;
-            const int     nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_red));
-
-            ggml_metal_encoder_set_pipeline(enc, pipeline_red);
-            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-            ggml_metal_encoder_set_buffer  (enc, bid_part, 1);
-            ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
-        }
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne1 + 31)/32, m_tiles, ne2*ne3, 128, 1, 1);
 
         return 1;
     }

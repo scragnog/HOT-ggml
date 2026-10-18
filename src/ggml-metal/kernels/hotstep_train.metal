@@ -1085,7 +1085,6 @@ kernel void kernel_out_prod_mm_f32(
         device const char * src0, // [ne00, ne01, ne02, ne03] F32, general strides
         device const char * src1, // accessed [i1,k] via nb10/nb11 (+ nb12/nb13), general strides
         device       char * dst,  // [ne00, ne1, ne2, ne3] F32
-        device      float * part, // split-K partials (args.nsplit > 1), see ggml_metal_kargs_out_prod
         threadgroup char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -1097,16 +1096,10 @@ kernel void kernel_out_prod_mm_f32(
     const int r1 = int(tgpig.x)*OP_NR1; // first N (i1) index of this tile
     const int r0 = int(tgpig.y)*OP_NR0; // first M (i0) index of this tile
 
-    // z folds (split,i3,i2): z = split*ne3*ne2 + i3*args.ne2 + i2 (matches the
-    // (rows,ne2,ne3)-as-(x,y,z) convention of the per-row kernel's own dispatch,
-    // just with x/y now tiled). The split picks this threadgroup's K chunk.
-    const int nz    = args.ne2*args.ne3;
-    const int iz    = int(tgpig.z) % nz;
-    const int split = int(tgpig.z) / nz;
-    const int i2  = iz % args.ne2;
-    const int i3  = iz / args.ne2;
-    const int k_beg = split*args.k_chunk;
-    const int k_end = min(args.ne01, k_beg + args.k_chunk);
+    // z folds (i2,i3): z = i3*args.ne2 + i2 (matches the (rows,ne2,ne3)-as-(x,y,z)
+    // convention of the per-row kernel's own dispatch, just with x/y now tiled).
+    const int i2  = int(tgpig.z) % args.ne2;
+    const int i3  = int(tgpig.z) / args.ne2;
     const int i02 = i2 / args.dps2;
     const int i03 = i3 / args.dps3;
 
@@ -1129,25 +1122,25 @@ kernel void kernel_out_prod_mm_f32(
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
     }
 
-    for (int k0 = k_beg; k0 < k_end; k0 += OP_NK) {
+    for (int k0 = 0; k0 < args.ne01; k0 += OP_NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (short e = 0; e < 16; ++e) {
             const int k = k0 + al_k0 + e;
-            sA[al_n*OP_LDS + al_k0 + e] = (a_row_ok && k < k_end)
+            sA[al_n*OP_LDS + al_k0 + e] = (a_row_ok && k < args.ne01)
                 ? *(device const float *) (src0_base + (int64_t) (r0 + al_n)*args.nb00 + (int64_t) k*args.nb01)
                 : 0.0f;
         }
         for (short e = 0; e < 8; ++e) {
             const int k = k0 + bl_k0 + e;
-            sB[bl_n*OP_LDS + bl_k0 + e] = (b_row_ok && k < k_end)
+            sB[bl_n*OP_LDS + bl_k0 + e] = (b_row_ok && k < args.ne01)
                 ? *(device const float *) (src1_base + (int64_t) (r1 + bl_n)*args.nb10 + (int64_t) k*args.nb11)
                 : 0.0f;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const int kk_end = min(OP_NK, k_end - k0);
+        const int kk_end = min(OP_NK, args.ne01 - k0);
         for (short kk = 0; kk < kk_end; kk += 8) {
             simdgroup_float8x8 ma[4]; // from sB (N dim, i1) -- 32 rows in 4 blocks of 8
             simdgroup_float8x8 mw[2]; // from sA (M dim, i0) -- this simdgroup's 16 cols in 2 blocks of 8
@@ -1188,11 +1181,7 @@ kernel void kernel_out_prod_mm_f32(
         const int i1 = r1 + row;
         const int i0 = r0 + col;
         if (i1 < args.ne1 && i0 < args.ne00) {
-            if (args.nsplit == 1) {
-                *(device float *) (dst_base + (int64_t) i1*args.nb1 + (int64_t) i0*sizeof(float)) = sc[row*OP_NR0 + col];
-            } else {
-                part[((int64_t) int(tgpig.z)*args.ne1 + i1)*args.ne00 + i0] = sc[row*OP_NR0 + col];
-            }
+            *(device float *) (dst_base + (int64_t) i1*args.nb1 + (int64_t) i0*sizeof(float)) = sc[row*OP_NR0 + col];
         }
     }
 }
@@ -1237,7 +1226,6 @@ kernel void kernel_out_prod_mm_f32_sm(
         device const char * src0, // [ne00, ne01, ne02, ne03] F32, general strides
         device const char * src1, // accessed [i1,k] via nb10/nb11 (+ nb12/nb13), general strides
         device       char * dst,  // [ne00, ne1, ne2, ne3] F32
-        device      float * part, // split-K partials (args.nsplit > 1), see ggml_metal_kargs_out_prod
         threadgroup char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -1249,13 +1237,8 @@ kernel void kernel_out_prod_mm_f32_sm(
     const int r1 = int(tgpig.x)*OP_NR1_SM; // first N (i1) index of this tile
     const int r0 = int(tgpig.y)*OP_NR0_SM; // first M (i0) index of this tile
 
-    const int nz    = args.ne2*args.ne3;
-    const int iz    = int(tgpig.z) % nz;
-    const int split = int(tgpig.z) / nz;
-    const int i2  = iz % args.ne2;
-    const int i3  = iz / args.ne2;
-    const int k_beg = split*args.k_chunk;
-    const int k_end = min(args.ne01, k_beg + args.k_chunk);
+    const int i2  = int(tgpig.z) % args.ne2;
+    const int i3  = int(tgpig.z) / args.ne2;
     const int i02 = i2 / args.dps2;
     const int i03 = i3 / args.dps3;
 
@@ -1283,25 +1266,25 @@ kernel void kernel_out_prod_mm_f32_sm(
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
     }
 
-    for (int k0 = k_beg; k0 < k_end; k0 += OP_NK) {
+    for (int k0 = 0; k0 < args.ne01; k0 += OP_NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (short e = 0; e < 8; ++e) {
             const int k = k0 + al_k0 + e;
-            sA[al_n*OP_LDS + al_k0 + e] = (a_row_ok && k < k_end)
+            sA[al_n*OP_LDS + al_k0 + e] = (a_row_ok && k < args.ne01)
                 ? *(device const float *) (src0_base + (int64_t) (r0 + al_n)*args.nb00 + (int64_t) k*args.nb01)
                 : 0.0f;
         }
         for (short e = 0; e < 8; ++e) {
             const int k = k0 + bl_k0 + e;
-            sB[bl_n*OP_LDS + bl_k0 + e] = (b_row_ok && k < k_end)
+            sB[bl_n*OP_LDS + bl_k0 + e] = (b_row_ok && k < args.ne01)
                 ? *(device const float *) (src1_base + (int64_t) (r1 + bl_n)*args.nb10 + (int64_t) k*args.nb11)
                 : 0.0f;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const int kk_end = min(OP_NK, k_end - k0);
+        const int kk_end = min(OP_NK, args.ne01 - k0);
         for (short kk = 0; kk < kk_end; kk += 8) {
             simdgroup_float8x8 ma[2]; // from sB (N dim, i1) -- this simdgroup's 16-wide N half, 2 blocks of 8
             simdgroup_float8x8 mw[2]; // from sA (M dim, i0) -- this simdgroup's 16-wide M half, 2 blocks of 8
@@ -1340,42 +1323,9 @@ kernel void kernel_out_prod_mm_f32_sm(
         const int i1 = r1 + row;
         const int i0 = r0 + col;
         if (i1 < args.ne1 && i0 < args.ne00) {
-            if (args.nsplit == 1) {
-                *(device float *) (dst_base + (int64_t) i1*args.nb1 + (int64_t) i0*sizeof(float)) = sc[row*OP_NR0_SM + col];
-            } else {
-                part[((int64_t) int(tgpig.z)*args.ne1 + i1)*args.ne00 + i0] = sc[row*OP_NR0_SM + col];
-            }
+            *(device float *) (dst_base + (int64_t) i1*args.nb1 + (int64_t) i0*sizeof(float)) = sc[row*OP_NR0_SM + col];
         }
     }
-}
-
-// HOT-Step: split-K reduce for the tiled OUT_PROD kernels above. One thread
-// per dst element sums its args.nsplit partials in split order 0..nsplit-1:
-// a fixed order, no atomics, so repeat runs are bit-identical. Partial
-// layout: part[((split*ne3*ne2 + i3*ne2 + i2)*ne1 + i1)*ne00 + i0].
-kernel void kernel_out_prod_reduce_f32(
-        constant ggml_metal_kargs_out_prod & args,
-        device const float * part,
-        device       char  * dst,
-        uint tid[[thread_position_in_grid]]) {
-    const int64_t per_split = (int64_t) args.ne00*args.ne1*args.ne2*args.ne3;
-    if ((int64_t) tid >= per_split) {
-        return;
-    }
-
-    const int64_t i0 = tid % args.ne00;
-    const int64_t r  = tid / args.ne00;
-    const int64_t i1 = r % args.ne1;
-    const int64_t iz = r / args.ne1;
-    const int64_t i2 = iz % args.ne2;
-    const int64_t i3 = iz / args.ne2;
-
-    float sum = part[tid];
-    for (int s = 1; s < args.nsplit; ++s) {
-        sum += part[s*per_split + tid];
-    }
-
-    *(device float *) (dst + i1*args.nb1 + i2*args.nb2 + i3*args.nb3 + i0*sizeof(float)) = sum;
 }
 
 // HOT-Step: FLASH_ATTN_TRAIN / FLASH_ATTN_TRAIN_BACK (kernel #7). See
