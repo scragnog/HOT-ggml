@@ -390,6 +390,210 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+#if defined(GGML_METAL_HAS_BF16) && !defined(GGML_METAL_HAS_TENSOR)
+// HOT-Step: half pre-pass for kernel_mul_mm_bf16_f32 in training graphs (ggml_metal_op_mul_mat_hp).
+// Two pre-passes write 16-bit copies of the operands plus one flag per 8-wide K block of each tile
+// (64 weight rows, 32 activation rows), set when every value in it is exact in half. The GEMM runs a
+// 32-wide K step on the half MAC when all four flags of both tiles are set, and on the bfloat MAC
+// otherwise. Half and bfloat products of values exact in both are bit-identical on Apple8, also
+// mixed per step (HOTSTEP-347 probe), so the output matches kernel_mul_mm_bf16_f32 bit for bit.
+
+// BF16 weights [M][K] -> half [M][K] and flags [ceil(M/64)][K/8]; grid (K/32, ceil(M/64)), 64 threads
+kernel void kernel_mul_mm_hp_cvt_w(
+        constant     int2   & KM,
+        device const bfloat * src,
+        device       half   * dst,
+        device       uchar  * mask,
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup bool votes[2][4];
+    const int K = KM.x, M = KM.y;
+    const int row = tgpig.y*64 + tiitg;
+    bool ok[4] = {true, true, true, true};
+    if (row < M) {
+        device const bfloat4 * s = (device const bfloat4 *)(src + (uint64_t) row*K + tgpig.x*32);
+        device       half4   * d = (device       half4   *)(dst + (uint64_t) row*K + tgpig.x*32);
+        FOR_UNROLL (short i = 0; i < 8; i++) {
+            const float4 f = (float4) s[i];
+            const half4  h = (half4) f;
+            ok[i/2] &= all((float4) h == f);
+            d[i] = h;
+        }
+    }
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const bool v = simd_all(ok[j]);
+        if (tiisg == 0) votes[sgitg][j] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiitg < 4) mask[tgpig.y*(K/8) + 4*tgpig.x + tiitg] = votes[0][tiitg] && votes[1][tiitg];
+}
+
+// F32 activations [N][K] -> (bfloat) x and half((bfloat) x), both [N][K], and flags [ceil(N/32)][K/8];
+// grid (K/32, ceil(N/32)), 32 threads
+kernel void kernel_mul_mm_hp_cvt_a(
+        constant     int2   & KN,
+        device const float  * src,
+        device       bfloat * dstb,
+        device       half   * dsth,
+        device       uchar  * mask,
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int K = KN.x, N = KN.y;
+    const int row = tgpig.y*32 + tiisg;
+    bool ok[4] = {true, true, true, true};
+    if (row < N) {
+        device const float4  * s  = (device const float4  *)(src  + (uint64_t) row*K + tgpig.x*32);
+        device       bfloat4 * db = (device       bfloat4 *)(dstb + (uint64_t) row*K + tgpig.x*32);
+        device       half4   * dh = (device       half4   *)(dsth + (uint64_t) row*K + tgpig.x*32);
+        FOR_UNROLL (short i = 0; i < 8; i++) {
+            const bfloat4 b = (bfloat4) s[i]; // the GEMM's own rounding of src1
+            const float4  f = (float4) b;
+            const half4   h = (half4) f;
+            ok[i/2] &= all((float4) h == f);
+            db[i] = b;
+            dh[i] = h;
+        }
+    }
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const bool v = simd_all(ok[j]);
+        if (tiisg == 0) mask[tgpig.y*(K/8) + 4*tgpig.x + j] = v;
+    }
+}
+
+// one 32-wide K step's 8x8 MACs on the staged tiles, in type S
+#define MUL_MM_HP_MAC(S)                                                                                \
+    {                                                                                                   \
+        threadgroup const S * lsma = (threadgroup const S *)(shmem) + 4*64*(sgitg%2);                   \
+        threadgroup const S * lsmb = (threadgroup const S *)(shmem + 4096) + 2*64*(sgitg/2);            \
+        simdgroup_matrix<S, 8, 8> ma[4];                                                                \
+        simdgroup_matrix<S, 8, 8> mb[2];                                                                \
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {                                                    \
+            simdgroup_barrier(mem_flags::mem_none);                                                     \
+            FOR_UNROLL (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);       \
+            simdgroup_barrier(mem_flags::mem_none);                                                     \
+            FOR_UNROLL (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);       \
+            simdgroup_barrier(mem_flags::mem_none);                                                     \
+            FOR_UNROLL (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]); \
+            lsma += 8*64;                                                                               \
+            lsmb += 4*64;                                                                               \
+        }                                                                                               \
+    }
+
+// kernel_mul_mm_bf16_f32 on the pre-pass copies: 2-D, K % 32 == 0, contiguous rows. Staging is a plain
+// 16-bit copy from the half or the bfloat copy, picked per step, so only the MAC depends on the type.
+kernel void kernel_mul_mm_bf16_f32_hp(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char   * src0,
+        device const half   * src0h,
+        device const bfloat * src1b,
+        device const half   * src1h,
+        device const uchar  * mask0,
+        device const uchar  * mask1,
+        device       char   * dst,
+        threadgroup  char   * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const int K  = args.ne00;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    // a thread shouldn't load data outside of the matrix
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    const short iy  = 8*(tiitg % NL1);
+
+    // [0] bfloat, [1] half; 16 values of a src0 row and 8 of a src1 row per step
+    device const ushort4 * xw[2] = { (device const ushort4 *)(src0 + args.nb01*(r0 + lr0)) + 4*il0,
+                                     (device const ushort4 *)(src0h + (uint64_t) K*(r0 + lr0)) + 4*il0 };
+    device const ushort4 * ya[2] = { (device const ushort4 *)(src1b + (uint64_t) K*(r1 + lr1) + iy),
+                                     (device const ushort4 *)(src1h + (uint64_t) K*(r1 + lr1) + iy) };
+
+    // the four 8-wide flags of a step, one byte each
+    device const uint * m0 = (device const uint *)(mask0 + tgpig.y*(K/8));
+    device const uint * m1 = (device const uint *)(mask1 + tgpig.x*(K/8));
+
+    // staging positions, as kernel_mul_mm
+    const short a_sx = 2*il0;
+    const short a_sy = (tiitg/NL0)/8;
+    const short a_lx = (tiitg/NL0)%8;
+    const short b_ib = 4*(tiitg%NL1) + (tiitg/NL1)/8;
+    const short b_ly = (tiitg/NL1)%8;
+
+    threadgroup ushort * sa = (threadgroup ushort *)(shmem);
+    threadgroup ushort * sb = (threadgroup ushort *)(shmem + 4096);
+
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int ks = 0; ks < K/NK; ks++) {
+        const bool  hp  = (m0[ks] & m1[ks]) == 0x01010101u;
+        const short sel = hp;
+
+        ushort4 ta[4];
+        FOR_UNROLL (short j = 0; j < 4; j++) ta[j] = xw[sel][8*ks + j];
+        const ushort4 tb0 = ya[sel][8*ks + 0];
+        const ushort4 tb1 = ya[sel][8*ks + 1];
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short ib = 8*(a_sx + i/8) + a_sy;
+            *(sa + 64*ib + 8*(i%8) + a_lx) = ta[i/4][i%4];
+        }
+        *(threadgroup ushort4 *)(sb + 64*b_ib + 8*b_ly + 0) = tb0;
+        *(threadgroup ushort4 *)(sb + 64*b_ib + 8*b_ly + 4) = tb1;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (hp) MUL_MM_HP_MAC(half) else MUL_MM_HP_MAC(bfloat)
+    }
+
+    if (FC_mul_mm_rnd || (FC_mul_mm_bc_out && (r0 + NR0 > args.ne0 || r1 + NR1 > args.ne1))) {
+        // stage through threadgroup memory, as kernel_mul_mm's round and tail paths
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j = sgitg; j < nr1; j += N_MM_SIMD_GROUP_X*N_MM_SIMD_GROUP_Y) {
+            device float * D = (device float *) dst + r0 + (r1 + j)*args.ne0;
+            threadgroup const float * C = (threadgroup const float *) shmem + j*NR0;
+            for (int i = tiitg%N_SIMDWIDTH; i < nr0; i += N_SIMDWIDTH) {
+                D[i] = FC_mul_mm_rnd ? bf16_round_cast<float>(C[i]) : C[i];
+            }
+        }
+        return;
+    }
+
+    device float * C = (device float *) dst + (r0 + 32*(sgitg & 1)) + (r1 + 16*(sgitg >> 1)) * args.ne0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+    }
+}
+
+#undef MUL_MM_HP_MAC
+#endif // GGML_METAL_HAS_BF16 && !GGML_METAL_HAS_TENSOR
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,

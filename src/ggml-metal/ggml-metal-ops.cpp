@@ -118,6 +118,11 @@ struct ggml_metal_op {
         ggml_metal_fusion_info_count_fusion(finfo, fusion);
     }
 
+    // HOT-Step: a training graph (built with grads); scheduler splits are views without them
+    bool is_train_graph() const {
+        return gf->grads != nullptr;
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -2747,6 +2752,149 @@ static bool ggml_metal_mm_k32_ok(const ggml_tensor * op, const ggml_metal_device
            ((uintptr_t) a->data) % 16 == 0 && ((uintptr_t) b->data) % 16 == 0 && ((uintptr_t) op->data) % 16 == 0;
 }
 
+// HOT-Step: half pre-pass for the base-forward BF16 GEMMs of training graphs (HOTSTEP-353), see
+// kernel_mul_mm_bf16_f32_hp. Bit-identical to kernel_mul_mm_bf16_f32; probed on Apple8 only.
+// GGML_METAL_HALF_PREPASS_DISABLE=1 turns it off.
+static bool ggml_metal_op_mul_mat_hp_ok(ggml_metal_op_t ctx, const ggml_tensor * op) {
+    static const bool disabled = getenv("GGML_METAL_HALF_PREPASS_DISABLE") != nullptr;
+
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ctx->dev);
+    if (disabled || !ctx->is_train_graph() || props->gpu_family != 8 || props->has_tensor || !props->has_bfloat) {
+        return false;
+    }
+
+    const ggml_tensor * s0 = op->src[0];
+    const ggml_tensor * s1 = op->src[1];
+    if (s0->type != GGML_TYPE_BF16 || s1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        s0->ne[0] % 32 != 0 || s0->ne[2] != 1 || s0->ne[3] != 1 || s1->ne[2] != 1 || s1->ne[3] != 1 ||
+        !ggml_is_contiguous(s0) || !ggml_is_contiguous(s1) || !ggml_is_contiguous(op) ||
+        (uintptr_t) s0->data % 16 != 0 || (uintptr_t) s1->data % 16 != 0) {
+        return false;
+    }
+
+    // base weights only: src0 reaches a frozen leaf without a transpose (the HOTSTEP-347 audit's
+    // "fwd" families); dX GEMMs and the BF16 casts of trainable LoRA factors keep today's kernel
+    const ggml_tensor * root = s0;
+    while (root->src[0] && (root->op == GGML_OP_VIEW || root->op == GGML_OP_RESHAPE || root->op == GGML_OP_PERMUTE ||
+                            root->op == GGML_OP_CONT || root->op == GGML_OP_CPY)) {
+        root = root->src[0];
+    }
+
+    return root->op == GGML_OP_NONE && !(root->flags & GGML_TENSOR_FLAG_PARAM);
+}
+
+// Scratch for the pre-pass copies, shared by all ops and grown on demand. Command buffers on the
+// queue are ordered on it by Metal's hazard tracking; within an encoder the op puts barriers around
+// its pre-pass. Old buffers are leaked on purpose: they may still be in flight.
+static ggml_metal_buffer_id ggml_metal_op_mul_mat_hp_scratch(ggml_metal_op_t ctx, size_t need) {
+    static std::mutex mtx;
+    static ggml_metal_buffer_t buf = nullptr;
+    static size_t cap = 0;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (need > cap) {
+        const size_t step = 64u << 20;
+        cap = (need + step - 1) / step * step;
+        buf = ggml_metal_buffer_init(ctx->dev, cap, false);
+        GGML_ASSERT(buf && "half pre-pass scratch allocation failed");
+    }
+
+    return ggml_metal_buffer_get_id_raw(buf);
+}
+
+static void ggml_metal_op_mul_mat_hp(ggml_metal_op_t ctx, const ggml_tensor * op, bool round_epilogue, ggml_metal_buffer_id bid_dst) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t K = op->src[0]->ne[0];
+    const int32_t M = op->src[0]->ne[1];
+    const int32_t N = op->src[1]->ne[1];
+
+    const int32_t nt0 = (M + 63)/64;
+    const int32_t nt1 = (N + 31)/32;
+
+    auto align = [](size_t x) { return (x + 255) & ~(size_t) 255; };
+    const size_t sz_w  = align((size_t) M*K*sizeof(uint16_t));
+    const size_t sz_a  = align((size_t) N*K*sizeof(uint16_t));
+    const size_t sz_m0 = align((size_t) nt0*(K/8));
+    const size_t sz_m1 = align((size_t) nt1*(K/8));
+
+    ggml_metal_buffer_id bid_w  = ggml_metal_op_mul_mat_hp_scratch(ctx, sz_w + 2*sz_a + sz_m0 + sz_m1);
+    ggml_metal_buffer_id bid_ab = bid_w;  bid_ab.offs += sz_w;
+    ggml_metal_buffer_id bid_ah = bid_ab; bid_ah.offs += sz_a;
+    ggml_metal_buffer_id bid_m0 = bid_ah; bid_m0.offs += sz_a;
+    ggml_metal_buffer_id bid_m1 = bid_m0; bid_m1.offs += sz_m0;
+
+    // earlier users of the scratch are done, and src1 is ready
+    ggml_metal_op_concurrency_reset(ctx);
+
+    {
+        int32_t KM[2] = { K, M };
+        auto pipeline = ggml_metal_library_get_pipeline_convrot8_named(lib, "kernel_mul_mm_hp_cvt_w");
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, KM, sizeof(KM), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_w,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_m0, 3);
+        ggml_metal_encoder_dispatch_threadgroups(enc, K/32, nt0, 1, 64, 1, 1);
+    }
+    {
+        int32_t KN[2] = { K, N };
+        auto pipeline = ggml_metal_library_get_pipeline_convrot8_named(lib, "kernel_mul_mm_hp_cvt_a");
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, KN, sizeof(KN), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_ab, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_ah, 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_m1, 4);
+        ggml_metal_encoder_dispatch_threadgroups(enc, K/32, nt1, 1, 32, 1, 1);
+    }
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    const bool bc_out = M % 64 != 0 || N % 32 != 0;
+
+    char name[64];
+    snprintf(name, sizeof(name), "kernel_mul_mm_bf16_f32_hp_bco=%d_rnd=%d", bc_out, round_epilogue);
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, name);
+    if (!pipeline.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_bool(cv, bc_out,         FC_MUL_MM + 1);
+        ggml_metal_cv_set_bool(cv, round_epilogue, FC_MUL_MM + 7);
+        pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mm_bf16_f32_hp", name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    ggml_metal_kargs_mul_mm args = {};
+    args.ne00 = K;
+    args.ne02 = 1;
+    args.nb01 = op->src[0]->nb[1];
+    args.nb02 = op->src[0]->nb[2];
+    args.nb03 = op->src[0]->nb[3];
+    args.ne12 = 1;
+    args.nb10 = op->src[1]->nb[0];
+    args.nb11 = op->src[1]->nb[1];
+    args.nb12 = op->src[1]->nb[2];
+    args.nb13 = op->src[1]->nb[3];
+    args.ne0  = M;
+    args.ne1  = N;
+    args.r2   = 1;
+    args.r3   = 1;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_w,  2);
+    ggml_metal_encoder_set_buffer  (enc, bid_ab, 3);
+    ggml_metal_encoder_set_buffer  (enc, bid_ah, 4);
+    ggml_metal_encoder_set_buffer  (enc, bid_m0, 5);
+    ggml_metal_encoder_set_buffer  (enc, bid_m1, 6);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst, 7);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 8192, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nt1, nt0, 1, 32, 4, 1);
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2893,14 +3041,19 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // store; the tensor-API kernel has no such epilogue
         const bool round_epilogue = !props_dev->has_tensor && ggml_metal_op_can_fuse_round(ctx, idx);
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, round_epilogue);
-
         ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
         if (round_epilogue) {
             ggml_metal_op_fuse_round_ranges(ctx, idx);
             bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + 1));
             n_fuse = 2;
         }
+
+        if (ggml_metal_op_mul_mat_hp_ok(ctx, op)) {
+            ggml_metal_op_mul_mat_hp(ctx, op, round_epilogue, bid_dst);
+            return n_fuse;
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, round_epilogue);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
