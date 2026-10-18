@@ -8,7 +8,7 @@ kernel void kernel_cpy_transpose(
         device const char * src [[buffer(1)]],
         device char * dst [[buffer(2)]],
         uint3 group [[threadgroup_position_in_grid]],
-        uint2 lane [[thread_position_in_threadgroup]]) {
+        uint3 lane [[thread_position_in_threadgroup]]) {
     threadgroup T tile[32][33];
     const ulong i2 = group.z % args.ne02;
     const ulong i3 = group.z / args.ne02;
@@ -31,6 +31,6 @@ kernel void kernel_cpy_transpose(
 }
 
 template [[host_name("kernel_cpy_transpose_f32")]]
-kernel void kernel_cpy_transpose<uint>(constant ggml_metal_kargs_cpy &, device const char *, device char *, uint3, uint2);
+kernel void kernel_cpy_transpose<uint>(constant ggml_metal_kargs_cpy &, device const char *, device char *, uint3, uint3);
 template [[host_name("kernel_cpy_transpose_bf16")]]
-kernel void kernel_cpy_transpose<ushort>(constant ggml_metal_kargs_cpy &, device const char *, device char *, uint3, uint2);
+kernel void kernel_cpy_transpose<ushort>(constant ggml_metal_kargs_cpy &, device const char *, device char *, uint3, uint3);
